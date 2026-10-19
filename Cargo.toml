@@ -2,7 +2,7 @@
 name = "minipom-tui"
 version = "0.0.1"
 edition = "2021"
-description = "Native TUI pomodoro timer, task manager and time tracker"
+description = "TUI pomodoro timer, task manager and time tracker"
 license = "MIT"
 repository = "https://github.com/tfkhdyt/minipom-tui"
 readme = "README.md"
