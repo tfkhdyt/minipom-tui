@@ -75,7 +75,7 @@ impl Data {
             .filter(|p| p.is_absolute())
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
             .unwrap_or_else(|| PathBuf::from("."));
-        base.join("minipom-2").join("data.json")
+        base.join("minipom-tui").join("data.json")
     }
 
     /// Loads the store. A missing file is normal; an unreadable file is moved

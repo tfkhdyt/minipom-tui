@@ -1,8 +1,13 @@
 [package]
-name = "minipom-2"
-version = "0.1.0"
+name = "minipom-tui"
+version = "0.0.1"
 edition = "2021"
 description = "Native TUI pomodoro timer, task manager and time tracker"
+license = "MIT"
+repository = "https://github.com/tfkhdyt/minipom-tui"
+readme = "README.md"
+keywords = ["pomodoro", "tui", "timer", "time-tracking", "productivity"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }

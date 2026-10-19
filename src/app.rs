@@ -576,7 +576,10 @@ mod tests {
 
     #[test]
     fn starting_a_done_task_clears_done() {
-        std::env::set_var("XDG_DATA_HOME", std::env::temp_dir().join("minipom-2-test"));
+        std::env::set_var(
+            "XDG_DATA_HOME",
+            std::env::temp_dir().join("minipom-tui-test"),
+        );
 
         let (mut app, id) = app_with_task();
         app.data.task_mut(id).unwrap().done = true;
@@ -672,7 +675,10 @@ mod tests {
     #[test]
     fn done_pauses_only_the_clocked_task() {
         // One test, so the redirected store cannot race with a sibling.
-        std::env::set_var("XDG_DATA_HOME", std::env::temp_dir().join("minipom-2-test"));
+        std::env::set_var(
+            "XDG_DATA_HOME",
+            std::env::temp_dir().join("minipom-tui-test"),
+        );
 
         let (mut app, id) = app_with_task();
         let other = app.data.add_task("other".into());
