@@ -10,7 +10,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{self, Event};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
 use ratatui::Terminal;
 
@@ -27,7 +27,8 @@ fn main() -> io::Result<()> {
     let result = run(&mut terminal, &mut app);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    // Leave the tab named "minipom" no longer than the app itself.
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, SetTitle(""))?;
     terminal.show_cursor()?;
     app.quit();
 
@@ -36,6 +37,8 @@ fn main() -> io::Result<()> {
 
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
     let tick = Duration::from_millis(200);
+    // Only write the title when it changes: once a second at most.
+    let mut title = String::new();
     loop {
         terminal.draw(|f| ui::draw(f, app))?;
         if event::poll(tick)? {
@@ -53,6 +56,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                     app.timer.phase.label()
                 ),
             );
+        }
+        let wanted = app.title();
+        if wanted != title {
+            execute!(terminal.backend_mut(), SetTitle(&wanted))?;
+            title = wanted;
         }
         if app.should_quit {
             return Ok(());

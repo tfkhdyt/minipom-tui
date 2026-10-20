@@ -509,6 +509,28 @@ impl App {
             .map(|t| t.title.clone())
     }
 
+    /// Terminal title: run state, time left and the task (or the phase when no
+    /// task is bound). Control characters are dropped so a stored title cannot
+    /// inject escape sequences.
+    pub fn title(&self) -> String {
+        let secs =
+            self.timer.remaining.as_secs() + u64::from(self.timer.remaining.subsec_millis() > 0);
+        let work = self.timer.phase.is_work();
+        let glyph = match (work, self.timer.running) {
+            (true, true) => "▶",
+            (false, true) => "☕",
+            (_, false) => "⏸",
+        };
+        let label = if work {
+            self.active_title()
+                .unwrap_or_else(|| self.timer.phase.label().to_lowercase())
+        } else {
+            self.timer.phase.label().to_lowercase()
+        };
+        let label: String = label.chars().filter(|c| !c.is_control()).collect();
+        format!("{glyph} {:02}:{:02} · {label}", secs / 60, secs % 60)
+    }
+
     /// The focus stretch in progress, as (task id, seconds so far). It is not
     /// in the log yet, so callers add it in to what they display.
     pub fn live(&self) -> Option<(u64, u64)> {
@@ -539,6 +561,32 @@ mod tests {
             status_expiry: None,
         };
         (app, id)
+    }
+
+    #[test]
+    fn title_shows_state_time_and_task() {
+        let (mut app, _) = app_with_task();
+        app.timer.start(Instant::now());
+        assert_eq!(app.title(), "▶ 25:00 · write docs");
+
+        app.timer.pause();
+        app.timer.remaining = Duration::from_secs(65);
+        assert_eq!(app.title(), "⏸ 01:05 · write docs");
+
+        // A break has no task bound, so the phase stands in.
+        app.active = None;
+        app.timer.phase = Phase::ShortBreak;
+        app.timer.remaining = Duration::from_secs(300);
+        assert_eq!(app.title(), "⏸ 05:00 · short break");
+        app.timer.start(Instant::now());
+        assert_eq!(app.title(), "☕ 05:00 · short break");
+    }
+
+    #[test]
+    fn title_drops_control_characters() {
+        let (mut app, id) = app_with_task();
+        app.data.task_mut(id).unwrap().title = "evil\x1b]0;pwned\x07".into();
+        assert_eq!(app.title(), "⏸ 25:00 · evil]0;pwned");
     }
 
     #[test]
