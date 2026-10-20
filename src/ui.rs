@@ -1,10 +1,14 @@
 //! Rendering. Read-only over `App`; every interaction lives in `app.rs`.
 
+use std::sync::OnceLock;
+use std::time::Instant;
+
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::{App, Input, HELP};
 use crate::model::Task;
@@ -190,13 +194,90 @@ fn with_live_time(app: &App, totals: &mut Vec<(String, u64)>) {
     }
 }
 
+/// One cell per this many milliseconds. Matches the 200ms event tick in main,
+/// so the text moves one column per frame.
+const MARQUEE_MS: usize = 200;
+/// Blank cells between the end of a looping line and its restart.
+const MARQUEE_GAP: &str = "   ";
+
+/// The animation's cell count, shared by every scrolling row. It starts at
+/// zero on the first draw so long titles begin at their first letter.
+fn marquee_offset() -> usize {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as usize / MARQUEE_MS
+}
+
+/// A `width`-cell window over `line` that loops with a gap, so a title too wide
+/// for its panel reads as running text instead of being cut off.
+fn marquee(line: &Line<'static>, offset: usize, width: usize) -> Line<'static> {
+    if width == 0 || line.width() <= width {
+        return line.clone();
+    }
+    let mut spans = line.spans.clone();
+    spans.push(Span::raw(MARQUEE_GAP));
+    spans.extend(line.spans.iter().cloned());
+
+    let start = offset % (line.width() + MARQUEE_GAP.len());
+    let end = start + width;
+    let mut out = Vec::new();
+    let mut x = 0;
+    for span in spans {
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let w = c.width().unwrap_or(0);
+            if w == 0 {
+                if x > start && x < end {
+                    text.push(c);
+                }
+                continue;
+            }
+            let (lo, hi) = (x.max(start), (x + w).min(end));
+            if hi > lo {
+                // A wide glyph cut by the window shows as blanks so the cells
+                // after it keep their column.
+                if x >= start && x + w <= end {
+                    text.push(c);
+                } else {
+                    text.push_str(&" ".repeat(hi - lo));
+                }
+            }
+            x += w;
+            if x >= end {
+                break;
+            }
+        }
+        if !text.is_empty() {
+            out.push(Span::styled(text, span.style));
+        }
+        if x >= end {
+            break;
+        }
+    }
+    Line::from(out)
+}
+
 fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     let ordered = app.data.ordered();
     let tasks: Vec<&Task> = ordered.iter().filter_map(|id| app.data.task(*id)).collect();
 
+    // Borders and the "> " highlight symbol sit outside the content.
+    let width = area.width.saturating_sub(4) as usize;
+    let offset = marquee_offset();
     let items: Vec<ListItem> = tasks
         .iter()
-        .map(|t| ListItem::new(task_line(app, t)))
+        .map(|t| {
+            // The checkbox stays put, and only the focused row runs.
+            let prefix = task_prefix(app, t);
+            let body = task_body(app, t);
+            let body = if app.selected == Some(t.id) {
+                marquee(&body, offset, width.saturating_sub(prefix.width()))
+            } else {
+                body
+            };
+            let mut spans = vec![prefix];
+            spans.extend(body.spans);
+            ListItem::new(Line::from(spans))
+        })
         .collect();
 
     let list = List::new(items)
@@ -208,7 +289,17 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn task_line(app: &App, t: &Task) -> Line<'static> {
+/// The fixed part of a row: active marker and checkbox.
+fn task_prefix(app: &App, t: &Task) -> Span<'static> {
+    let marker = if app.active == Some(t.id) { '*' } else { ' ' };
+    Span::styled(
+        format!("{marker}[{}] ", if t.done { 'x' } else { ' ' }),
+        Style::new().fg(TEXT),
+    )
+}
+
+/// The marquee part of a row: title, project, tags and tracked time.
+fn task_body(app: &App, t: &Task) -> Line<'static> {
     let live = app
         .live()
         .filter(|(id, _)| *id == t.id)
@@ -216,7 +307,6 @@ fn task_line(app: &App, t: &Task) -> Line<'static> {
         .unwrap_or(0);
     let total = app.data.total_seconds(t.id) + live;
 
-    let marker = if app.active == Some(t.id) { '*' } else { ' ' };
     // Everything stays at full strength, including on the selected row's lighter
     // surface. "Done" is carried by the checkbox and the strikethrough, not by
     // dimming the text into the background.
@@ -225,13 +315,8 @@ fn task_line(app: &App, t: &Task) -> Line<'static> {
     } else {
         Style::new().fg(TEXT)
     };
-    let mut spans = vec![
-        Span::styled(
-            format!("{marker}[{}] ", if t.done { 'x' } else { ' ' }),
-            Style::new().fg(TEXT),
-        ),
-        Span::styled(t.title.clone(), title_style),
-    ];
+    let mut spans = vec![Span::styled(t.title.clone(), title_style)];
+
     if let Some(project) = &t.project {
         spans.push(Span::styled(
             format!("  {project}"),
@@ -295,8 +380,13 @@ fn draw_focus(f: &mut Frame, app: &App, area: Rect) {
     let active = app
         .active_title()
         .unwrap_or_else(|| "(no task)".to_string());
+    let active_line = Line::from(format!("on: {active}"));
     f.render_widget(
-        Paragraph::new(format!("on: {active}")).wrap(Wrap { trim: true }),
+        Paragraph::new(marquee(
+            &active_line,
+            marquee_offset(),
+            rows[3].width as usize,
+        )),
         rows[3],
     );
 }
@@ -402,5 +492,27 @@ mod tests {
             assert_eq!(text.chars().count(), 5 * 3 + 4, "{text:?}");
         }
         assert_eq!(big_time(-5, Phase::Work), big_time(0, Phase::Work));
+    }
+
+    #[test]
+    fn marquee_shows_a_window_and_loops_through_the_gap() {
+        let line = Line::from("abcdef");
+        assert_eq!(marquee(&line, 0, 4).to_string(), "abcd");
+        assert_eq!(marquee(&line, 2, 4).to_string(), "cdef");
+        // 6 cells of text, then 3 cells of gap.
+        assert_eq!(marquee(&line, 7, 4).to_string(), "  ab");
+        assert_eq!(marquee(&line, 9, 4).to_string(), "abcd");
+        // A line that already fits is left alone at any offset.
+        assert_eq!(marquee(&line, 5, 6).to_string(), "abcdef");
+        assert_eq!(marquee(&line, 5, 0).to_string(), "abcdef");
+    }
+
+    #[test]
+    fn marquee_counts_wide_characters_as_two_cells() {
+        let line = Line::from("中文字");
+        assert_eq!(marquee(&line, 0, 2).to_string(), "中");
+        assert_eq!(marquee(&line, 2, 2).to_string(), "文");
+        // Starting mid-glyph blanks the cell rather than drawing half of it.
+        assert_eq!(marquee(&line, 1, 2).to_string(), "  ");
     }
 }
