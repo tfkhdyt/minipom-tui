@@ -6,7 +6,7 @@ use std::time::Instant;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
@@ -122,6 +122,34 @@ fn phase_line(app: &App) -> Line<'static> {
     ])
 }
 
+/// The list takes the larger share, Focus and Today split the rest evenly. When
+/// the window looks portrait, that pair sits under the list instead of beside it,
+/// so the list keeps its width and the two panels stay readable.
+///
+/// Cells are around twice as tall as they are wide, so a window can look
+/// portrait while still having more columns than rows. The 2x factor compares
+/// what the eye sees rather than raw cell counts.
+fn panes(area: Rect) -> (Rect, Rect, Rect) {
+    let portrait = u32::from(area.height) * 2 > u32::from(area.width);
+    let shares = [Constraint::Percentage(62), Constraint::Percentage(38)];
+    let (list, side) = if portrait {
+        let rows = Layout::vertical(shares).split(area);
+        (rows[0], rows[1])
+    } else {
+        let cols = Layout::horizontal(shares).split(area);
+        (cols[0], cols[1])
+    };
+    let halves = [Constraint::Percentage(50), Constraint::Percentage(50)];
+    let (focus, today) = if portrait {
+        let cols = Layout::horizontal(halves).split(side);
+        (cols[0], cols[1])
+    } else {
+        let rows = Layout::vertical(halves).split(side);
+        (rows[0], rows[1])
+    };
+    (list, focus, today)
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
     // No backdrop is painted: unset cells keep the terminal's own background,
     // which is what lets a translucent terminal stay translucent.
@@ -132,15 +160,10 @@ pub fn draw(f: &mut Frame, app: &App) {
     let (main, status) = (rows[0], rows[1]);
     let status_rows = Layout::vertical([Constraint::Length(1); 2]).split(status);
 
-    let cols =
-        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(main);
-    draw_tasks(f, app, cols[0]);
-
-    // Focus and Today split the side column evenly.
-    let side =
-        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(cols[1]);
-    draw_focus(f, app, side[0]);
-    draw_today(f, app, side[1]);
+    let (list, focus, today) = panes(main);
+    draw_tasks(f, app, list);
+    draw_focus(f, app, focus);
+    draw_today(f, app, today);
 
     let hints = Paragraph::new(HELP).style(Style::new().fg(BORDER));
     f.render_widget(hints, status_rows[0]);
@@ -404,6 +427,15 @@ fn task_row(
     Line::from(spans)
 }
 
+/// Rows the wrapped title needs, leaving the clock, state and bar their seven
+/// rows above it.
+fn title_height(title: &Line<'static>, width: u16, height: u16) -> u16 {
+    let lines = Paragraph::new(title.clone())
+        .wrap(Wrap { trim: true })
+        .line_count(width.max(1));
+    lines.min(height.saturating_sub(7) as usize).max(1) as u16
+}
+
 fn draw_focus(f: &mut Frame, app: &App, area: Rect) {
     let color = phase_color(app.timer.phase);
     // The phase lives in the title, so the body has room for state, bar and task.
@@ -421,13 +453,33 @@ fn draw_focus(f: &mut Frame, app: &App, area: Rect) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let active = app.active_title();
+    let active_style = if active.is_some() {
+        Style::new().fg(TEXT)
+    } else {
+        Style::new().fg(BORDER)
+    };
+    let title = Line::from(vec![
+        Span::styled("on: ", Style::new().fg(BORDER)),
+        Span::styled(
+            active.unwrap_or_else(|| "(no task)".to_string()),
+            active_style,
+        ),
+    ]);
+    // A long title takes as many rows as it wraps to, but never squeezes out
+    // the clock, state and bar above it.
+    let title_rows = title_height(&title, inner.width, inner.height);
+    let title = Paragraph::new(title)
+        .wrap(Wrap { trim: true })
+        .alignment(Alignment::Center);
+
     // The panel is taller than its content, so the timer sits in the middle of
     // the extra space rather than hugging the top border.
     let rows = Layout::vertical([
         Constraint::Length(5),
         Constraint::Length(1),
         Constraint::Length(1),
-        Constraint::Length(1),
+        Constraint::Length(title_rows),
     ])
     .flex(Flex::Center)
     .split(inner);
@@ -459,28 +511,7 @@ fn draw_focus(f: &mut Frame, app: &App, area: Rect) {
         rows[2],
     );
 
-    let active = app.active_title();
-    let active_style = if active.is_some() {
-        Style::new().fg(TEXT)
-    } else {
-        Style::new().fg(BORDER)
-    };
-    let active_line = Line::from(vec![
-        Span::styled("on: ", Style::new().fg(BORDER)),
-        Span::styled(
-            active.unwrap_or_else(|| "(no task)".to_string()),
-            active_style,
-        ),
-    ]);
-    f.render_widget(
-        Paragraph::new(marquee(
-            &active_line,
-            marquee_offset(),
-            rows[3].width as usize,
-        ))
-        .alignment(Alignment::Center),
-        rows[3],
-    );
+    f.render_widget(title, rows[3]);
 }
 
 fn draw_today(f: &mut Frame, app: &App, area: Rect) {
@@ -575,6 +606,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn panes_stack_the_side_panels_when_the_window_looks_portrait() {
+        // 68x48 cells is roughly 650x830 px on a normal cell, so it reads as
+        // portrait even though there are more columns than rows.
+        let (list, focus, today) = panes(Rect::new(0, 0, 68, 48));
+        assert_eq!(list, Rect::new(0, 0, 68, 30));
+        assert_eq!(focus, Rect::new(0, 30, 34, 18));
+        assert_eq!(today, Rect::new(34, 30, 34, 18));
+
+        // Wide and short stays in the side column layout. 80x24 is about
+        // 720x410 px, so the side column is the shorter use of the space.
+        let (list, focus, today) = panes(Rect::new(0, 0, 120, 35));
+        assert_eq!(list, Rect::new(0, 0, 74, 35));
+        assert_eq!(focus, Rect::new(74, 0, 46, 18));
+        assert_eq!(today, Rect::new(74, 18, 46, 17));
+
+        let (list, focus, today) = panes(Rect::new(0, 0, 80, 24));
+        assert_eq!(list, Rect::new(0, 0, 50, 24));
+        assert_eq!(focus, Rect::new(50, 0, 30, 12));
+        assert_eq!(today, Rect::new(50, 12, 30, 12));
+    }
+
+    #[test]
     fn big_time_draws_every_digit_three_cells_wide() {
         let lines = big_time(25 * 60, Phase::Work);
         assert_eq!(lines.len(), 5);
@@ -597,6 +650,16 @@ mod tests {
         // A line that already fits is left alone at any offset.
         assert_eq!(marquee(&line, 5, 6).to_string(), "abcdef");
         assert_eq!(marquee(&line, 5, 0).to_string(), "abcdef");
+    }
+
+    #[test]
+    fn focus_title_wraps_but_keeps_the_timer_rows() {
+        let line = Line::from("x".repeat(40));
+        assert_eq!(title_height(&line, 10, 20), 4);
+        assert_eq!(title_height(&line, 100, 20), 1);
+        // A short panel keeps the seven rows above even if the title is cut.
+        assert_eq!(title_height(&line, 10, 10), 3);
+        assert_eq!(title_height(&line, 10, 5), 1);
     }
 
     #[test]
