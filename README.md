@@ -6,9 +6,9 @@ A pomodoro timer, task list and time tracker that runs in the terminal.
 
 - **Pomodoro** - 25/5/15 minute work, short break and long break cycle. A long
   break lands after every 4 work phases.
-- **Tasks** - add, rename, complete and delete. The list is grouped by project
-  (tasks with no project first, then alphabetically by project and title) with
-  completed tasks last, and tags are shown inline.
+- **Tasks** - add, rename, complete and delete. The list has a heading per
+  project (tasks with no project first, then alphabetically), with completed
+  tasks last inside their project and tags shown inline.
 - **Time tracking** - every work phase is logged against the task you started it
   on. Breaks are never logged. The side panel totals today's time per project.
 - **Resume** - the clock and the day's pomodoro count survive a restart.

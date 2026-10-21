@@ -203,11 +203,17 @@ impl Data {
         totals.into_iter().collect()
     }
 
-    /// Tasks in display order: open before done, then grouped by project
-    /// (tasks with no project first), then by title.
+    /// Tasks in display order: grouped by project (tasks with no project first),
+    /// open before done within each project, then by title.
     pub fn ordered(&self) -> Vec<u64> {
         let mut tasks: Vec<&Task> = self.tasks.iter().collect();
-        tasks.sort_by_key(|t| (t.done, t.project.clone(), t.title.to_lowercase()));
+        tasks.sort_by_key(|t| {
+            (
+                t.project.clone().filter(|p| !p.is_empty()),
+                t.done,
+                t.title.to_lowercase(),
+            )
+        });
         tasks.iter().map(|t| t.id).collect()
     }
 }
@@ -312,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn ordered_puts_open_tasks_first_grouped_by_project() {
+    fn ordered_groups_by_project_with_done_last_in_each() {
         let mut d = Data::default();
         let bbb = d.add_task("bbb".into());
         let aaa = d.add_task("aaa".into());
@@ -321,6 +327,7 @@ mod tests {
         assert_eq!(d.ordered(), vec![aaa, bbb, ccc]);
         d.task_mut(aaa).unwrap().project = Some("z".into());
         d.task_mut(ccc).unwrap().done = true;
-        assert_eq!(d.ordered(), vec![bbb, aaa, ccc]);
+        // Done stays inside its own project instead of splitting it in two.
+        assert_eq!(d.ordered(), vec![bbb, ccc, aaa]);
     }
 }

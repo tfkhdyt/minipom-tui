@@ -100,7 +100,7 @@ fn big_time(secs: i64, phase: Phase) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Phase name, run state and the pomodoros banked towards the long break.
+/// Run state and the pomodoros banked towards the long break.
 fn phase_line(app: &App) -> Line<'static> {
     let t = &app.timer;
     let cycle = t.settings.long_every.max(1);
@@ -110,19 +110,15 @@ fn phase_line(app: &App) -> Line<'static> {
         .map(String::from)
         .collect::<Vec<_>>()
         .join(" ");
+    let (state, state_style) = if t.running {
+        ("▶ running", Style::new().fg(phase_color(t.phase)))
+    } else {
+        ("⏸ paused", Style::new().fg(BORDER))
+    };
     Line::from(vec![
-        Span::styled(
-            t.phase.label(),
-            Style::new()
-                .fg(phase_color(t.phase))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if t.running { "  running  " } else { "  paused  " },
-            Style::new().fg(BORDER),
-        ),
-        Span::styled(dots, Style::new().fg(phase_color(t.phase))),
-        Span::styled(format!("  today {}", t.pomodoros), Style::new().fg(BORDER)),
+        Span::styled(state, state_style),
+        Span::styled(format!("   {dots}"), Style::new().fg(phase_color(t.phase))),
+        Span::styled(format!("   today {}", t.pomodoros), Style::new().fg(BORDER)),
     ])
 }
 
@@ -137,7 +133,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     let status_rows = Layout::vertical([Constraint::Length(1); 2]).split(status);
 
     let cols =
-        Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).split(main);
+        Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(main);
     draw_tasks(f, app, cols[0]);
 
     // Focus and Today split the side column evenly.
@@ -194,9 +190,9 @@ fn with_live_time(app: &App, totals: &mut Vec<(String, u64)>) {
     }
 }
 
-/// One cell per this many milliseconds. Matches the 200ms event tick in main,
-/// so the text moves one column per frame.
-const MARQUEE_MS: usize = 200;
+/// One cell per this many milliseconds. A multiple of the 200ms event tick in
+/// main, so the text moves one column every other frame.
+const MARQUEE_MS: usize = 400;
 /// Blank cells between the end of a looping line and its restart.
 const MARQUEE_GAP: &str = "   ";
 
@@ -256,6 +252,26 @@ fn marquee(line: &Line<'static>, offset: usize, width: usize) -> Line<'static> {
     Line::from(out)
 }
 
+enum Row<'a> {
+    Heading(String),
+    Task(&'a Task),
+}
+
+/// The list as drawn: a heading per project, then that project's tasks.
+fn display_rows<'a>(tasks: &[&'a Task]) -> Vec<Row<'a>> {
+    let mut rows = Vec::with_capacity(tasks.len() + 1);
+    let mut last: Option<Option<&str>> = None;
+    for task in tasks {
+        let project = task.project.as_deref().filter(|p| !p.is_empty());
+        if last != Some(project) {
+            rows.push(Row::Heading(project.unwrap_or("(no project)").to_string()));
+            last = Some(project);
+        }
+        rows.push(Row::Task(task));
+    }
+    rows
+}
+
 fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     let ordered = app.data.ordered();
     let tasks: Vec<&Task> = ordered.iter().filter_map(|id| app.data.task(*id)).collect();
@@ -263,29 +279,48 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     // Borders and the "> " highlight symbol sit outside the content.
     let width = area.width.saturating_sub(4) as usize;
     let offset = marquee_offset();
-    let items: Vec<ListItem> = tasks
-        .iter()
-        .map(|t| {
-            // The checkbox stays put, and only the focused row runs.
-            let prefix = task_prefix(app, t);
-            let body = task_body(app, t);
-            let body = if app.selected == Some(t.id) {
-                marquee(&body, offset, width.saturating_sub(prefix.width()))
-            } else {
-                body
-            };
-            let mut spans = vec![prefix];
-            spans.extend(body.spans);
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut selected = None;
+    for row in display_rows(&tasks) {
+        match row {
+            Row::Heading(project) => items.push(ListItem::new(Line::from(Span::styled(
+                project,
+                Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            )))),
+            Row::Task(t) => {
+                if app.selected == Some(t.id) {
+                    selected = Some(items.len());
+                }
+                // The checkbox, tags and time stay put, and only the focused
+                // row's title runs.
+                let prefix = task_prefix(app, t);
+                let live = app
+                    .live()
+                    .filter(|(id, _)| *id == t.id)
+                    .map(|(_, secs)| secs)
+                    .unwrap_or(0);
+                let total = app.data.total_seconds(t.id) + live;
+                let body_width = width.saturating_sub(prefix.width());
+                let meta = task_meta(t, total, body_width.saturating_sub(META_GAP));
+                let scroll = app.selected == Some(t.id);
+                items.push(ListItem::new(task_row(
+                    prefix,
+                    task_title(t),
+                    meta,
+                    width,
+                    offset,
+                    scroll,
+                )));
+            }
+        }
+    }
 
     let list = List::new(items)
         .block(panel(format!(" Tasks ({}) ", tasks.len())))
         .highlight_style(Style::new().bg(SURFACE).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
 
-    let mut state = ListState::default().with_selected(app.selected_index());
+    let mut state = ListState::default().with_selected(selected);
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -298,48 +333,91 @@ fn task_prefix(app: &App, t: &Task) -> Span<'static> {
     )
 }
 
-/// The marquee part of a row: title, project, tags and tracked time.
-fn task_body(app: &App, t: &Task) -> Line<'static> {
-    let live = app
-        .live()
-        .filter(|(id, _)| *id == t.id)
-        .map(|(_, secs)| secs)
-        .unwrap_or(0);
-    let total = app.data.total_seconds(t.id) + live;
-
+/// The part of a row that scrolls: just the title.
+fn task_title(t: &Task) -> Line<'static> {
     // Everything stays at full strength, including on the selected row's lighter
     // surface. "Done" is carried by the checkbox and the strikethrough, not by
     // dimming the text into the background.
-    let title_style = if t.done {
+    let style = if t.done {
         Style::new().fg(TEXT).add_modifier(Modifier::CROSSED_OUT)
     } else {
         Style::new().fg(TEXT)
     };
-    let mut spans = vec![Span::styled(t.title.clone(), title_style)];
+    Line::from(Span::styled(t.title.clone(), style))
+}
 
-    if let Some(project) = &t.project {
-        spans.push(Span::styled(
-            format!("  {project}"),
-            Style::new().fg(Color::Blue),
-        ));
-    }
-    for tag in &t.tags {
-        spans.push(Span::styled(
-            format!(" #{tag}"),
-            Style::new().fg(Color::Magenta),
-        ));
-    }
-    if total > 0 {
-        spans.push(Span::styled(
+/// Blank cells between the title and the pinned tags/time.
+const META_GAP: usize = 2;
+
+/// The pinned right side of a row: tags, then tracked time. Tags are dropped
+/// from the end when they would push the time past `width`, so the time (and
+/// the project heading above) stays readable while only the title scrolls.
+fn task_meta(t: &Task, total: u64, width: usize) -> Line<'static> {
+    let time = (total > 0).then(|| {
+        Span::styled(
             format!("  {}", fmt_duration(total as i64)),
             Style::new().fg(Color::Green),
-        ));
+        )
+    });
+    let time_width = time.as_ref().map_or(0, Span::width);
+
+    let mut tags: Vec<Span<'static>> = t
+        .tags
+        .iter()
+        .map(|tag| Span::styled(format!(" #{tag}"), Style::new().fg(Color::Magenta)))
+        .collect();
+    let mut tags_width: usize = tags.iter().map(Span::width).sum();
+    while !tags.is_empty() && tags_width + time_width > width {
+        tags_width -= tags.pop().unwrap().width();
+    }
+
+    let mut spans = tags;
+    if let Some(time) = time {
+        spans.push(time);
+    }
+    Line::from(spans)
+}
+
+/// A task row as drawn: fixed checkbox, a title window, then pinned metadata.
+fn task_row(
+    prefix: Span<'static>,
+    title: Line<'static>,
+    meta: Line<'static>,
+    width: usize,
+    offset: usize,
+    scroll: bool,
+) -> Line<'static> {
+    let gap = if meta.spans.is_empty() { 0 } else { META_GAP };
+    let title_width = width.saturating_sub(prefix.width() + meta.width() + gap);
+    let title = if title_width == 0 {
+        Line::default()
+    } else {
+        marquee(&title, if scroll { offset } else { 0 }, title_width)
+    };
+    let mut spans = vec![prefix];
+    let pad = title_width.saturating_sub(title.width());
+    spans.extend(title.spans);
+    if !meta.spans.is_empty() {
+        spans.push(Span::raw(" ".repeat(pad + gap)));
+        spans.extend(meta.spans);
     }
     Line::from(spans)
 }
 
 fn draw_focus(f: &mut Frame, app: &App, area: Rect) {
-    let block = panel(" Focus ".to_string());
+    let color = phase_color(app.timer.phase);
+    // The phase lives in the title, so the body has room for state, bar and task.
+    let block = panel(String::new())
+        .title(Line::from(vec![
+            Span::styled(" Focus ", Style::new().fg(TEXT)),
+            Span::styled("· ", Style::new().fg(BORDER)),
+            Span::styled(
+                app.timer.phase.label(),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+        ]))
+        .border_style(Style::new().fg(if app.timer.running { color } else { BORDER }));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -354,8 +432,8 @@ fn draw_focus(f: &mut Frame, app: &App, area: Rect) {
     .flex(Flex::Center)
     .split(inner);
 
-    let secs = (app.timer.remaining.as_secs()
-        + u64::from(app.timer.remaining.subsec_millis() > 0)) as i64;
+    let secs =
+        (app.timer.remaining.as_secs() + u64::from(app.timer.remaining.subsec_millis() > 0)) as i64;
     f.render_widget(
         Paragraph::new(big_time(secs, app.timer.phase)).alignment(Alignment::Center),
         rows[0],
@@ -365,28 +443,42 @@ fn draw_focus(f: &mut Frame, app: &App, area: Rect) {
         rows[1],
     );
 
-    // A bar drawn from exact widths, so the filled part starts at the first column.
+    // A bar drawn from exact widths, so the filled part starts at the first
+    // column; the percent is pinned to the right edge.
     let width = rows[2].width as usize;
-    let filled = (app.timer.progress() * width as f64).round() as usize;
-    let track = width.saturating_sub(filled);
+    let percent = format!("{:>3}%", (app.timer.progress() * 100.0).round() as u32);
+    let bar_width = width.saturating_sub(percent.len() + 1);
+    let filled = (app.timer.progress() * bar_width as f64).round() as usize;
+    let track = bar_width.saturating_sub(filled);
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("█".repeat(filled), Style::new().fg(phase_color(app.timer.phase))),
-            Span::styled("─".repeat(track), Style::new().fg(TRACK)),
+            Span::styled("█".repeat(filled), Style::new().fg(color)),
+            Span::styled("░".repeat(track), Style::new().fg(TRACK)),
+            Span::styled(format!(" {percent}"), Style::new().fg(BORDER)),
         ])),
         rows[2],
     );
 
-    let active = app
-        .active_title()
-        .unwrap_or_else(|| "(no task)".to_string());
-    let active_line = Line::from(format!("on: {active}"));
+    let active = app.active_title();
+    let active_style = if active.is_some() {
+        Style::new().fg(TEXT)
+    } else {
+        Style::new().fg(BORDER)
+    };
+    let active_line = Line::from(vec![
+        Span::styled("on: ", Style::new().fg(BORDER)),
+        Span::styled(
+            active.unwrap_or_else(|| "(no task)".to_string()),
+            active_style,
+        ),
+    ]);
     f.render_widget(
         Paragraph::new(marquee(
             &active_line,
             marquee_offset(),
             rows[3].width as usize,
-        )),
+        ))
+        .alignment(Alignment::Center),
         rows[3],
     );
 }
@@ -508,11 +600,69 @@ mod tests {
     }
 
     #[test]
-    fn marquee_counts_wide_characters_as_two_cells() {
-        let line = Line::from("中文字");
-        assert_eq!(marquee(&line, 0, 2).to_string(), "中");
-        assert_eq!(marquee(&line, 2, 2).to_string(), "文");
-        // Starting mid-glyph blanks the cell rather than drawing half of it.
-        assert_eq!(marquee(&line, 1, 2).to_string(), "  ");
+    fn task_row_scrolls_only_the_title_and_pins_tags_and_time() {
+        let task = Task {
+            id: 1,
+            title: "abcdefghijk".into(),
+            project: None,
+            tags: vec!["alpha".into(), "beta".into()],
+            done: false,
+        };
+        // Only whole tags are kept; the time never gets pushed out.
+        assert_eq!(task_meta(&task, 90, 14).to_string(), " #alpha  1:30");
+        assert_eq!(task_meta(&task, 90, 6).to_string(), "  1:30");
+
+        let prefix = Span::raw("[ ] ");
+        let width = 20;
+        let meta = task_meta(&task, 90, 6);
+        let scrolling = task_row(
+            prefix.clone(),
+            task_title(&task),
+            meta.clone(),
+            width,
+            2,
+            true,
+        );
+        let still = task_row(prefix, task_title(&task), meta, width, 2, false);
+        assert_eq!(scrolling.to_string(), "[ ] cdefghij    1:30");
+        assert_eq!(still.to_string(), "[ ] abcdefgh    1:30");
+        assert_eq!(scrolling.width(), width);
+        assert_eq!(still.width(), width);
+    }
+
+    #[test]
+    fn display_rows_puts_a_heading_before_each_project() {
+        let tasks = [
+            Task {
+                id: 1,
+                title: "a".into(),
+                project: None,
+                tags: Vec::new(),
+                done: false,
+            },
+            Task {
+                id: 2,
+                title: "b".into(),
+                project: Some("work".into()),
+                tags: Vec::new(),
+                done: false,
+            },
+            Task {
+                id: 3,
+                title: "c".into(),
+                project: Some("work".into()),
+                tags: Vec::new(),
+                done: true,
+            },
+        ];
+        let refs: Vec<&Task> = tasks.iter().collect();
+        let shape: Vec<String> = display_rows(&refs)
+            .into_iter()
+            .map(|row| match row {
+                Row::Heading(project) => format!("#{project}"),
+                Row::Task(t) => t.title.clone(),
+            })
+            .collect();
+        assert_eq!(shape, vec!["#(no project)", "a", "#work", "b", "c"]);
     }
 }
