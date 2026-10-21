@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
-use crate::app::{App, Input, HELP};
+use crate::app::{App, Confirm, Field, Input, HELP};
 use crate::model::Task;
 use crate::timer::Phase;
 
@@ -55,9 +55,9 @@ fn panel(title: String) -> Block<'static> {
 
 fn phase_color(phase: Phase) -> Color {
     match phase {
-        Phase::Work => Color::Indexed(203),        // #ff5f5f
-        Phase::ShortBreak => Color::Indexed(114),  // #87d787
-        Phase::LongBreak => Color::Indexed(81),    // #5fd7ff
+        Phase::Work => Color::Indexed(203),       // #ff5f5f
+        Phase::ShortBreak => Color::Indexed(114), // #87d787
+        Phase::LongBreak => Color::Indexed(81),   // #5fd7ff
     }
 }
 
@@ -179,18 +179,22 @@ pub fn draw(f: &mut Frame, app: &App) {
     if let Some(input) = &app.input {
         draw_input(f, input);
     }
-    if let Some(id) = app.confirm_delete {
-        let title = app
-            .data
-            .task(id)
-            .map(|t| t.title.clone())
-            .unwrap_or_default();
-        draw_prompt(
-            f,
-            "Delete",
-            &format!("{title}? y to confirm"),
-            Some(Color::Red),
-        );
+    if let Some(confirm) = app.confirm_delete {
+        let text = match confirm {
+            Confirm::One(id) => {
+                let title = app
+                    .data
+                    .task(id)
+                    .map(|t| t.title.clone())
+                    .unwrap_or_default();
+                format!("{title}? y to confirm")
+            }
+            Confirm::Completed => format!(
+                "delete all {} completed? y to confirm",
+                app.data.tasks.iter().filter(|t| t.done).count()
+            ),
+        };
+        draw_prompt(f, "Delete", &text, Some(Color::Red));
     }
 }
 
@@ -538,36 +542,58 @@ fn draw_today(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_input(f: &mut Frame, input: &Input) {
-    let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{}: ", input.prompt), Style::new().fg(Color::Cyan)),
-        Span::raw(input.buf.clone()),
-        Span::styled(
-            "_",
-            Style::new()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::SLOW_BLINK),
-        ),
-    ])];
+    // All three fields share one dialog, so the whole task can be read at once.
+    let mut lines: Vec<Line<'static>> = [Field::Title, Field::Project, Field::Tags]
+        .into_iter()
+        .map(|field| {
+            let focused = input.field == field;
+            let label_style = if focused {
+                Style::new().fg(Color::Cyan)
+            } else {
+                Style::new().fg(BORDER)
+            };
+            let mut spans = vec![
+                Span::styled(format!("{:<8}", field.label()), label_style),
+                Span::styled(input.value(field).to_string(), Style::new().fg(TEXT)),
+            ];
+            if focused {
+                spans.push(Span::styled(
+                    "_",
+                    Style::new()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
     let matches = input.matches();
     if !matches.is_empty() {
-        let mut spans = vec![Span::styled("tab: ", Style::new().fg(BORDER))];
-        for (i, value) in matches.iter().take(4).enumerate() {
+        // Four per page, following the highlighted one when it moves past them.
+        let start = input.choice / 4 * 4;
+        let mut spans = vec![Span::styled("→ ", Style::new().fg(BORDER))];
+        for (i, value) in matches.iter().skip(start).take(4).enumerate() {
             if i > 0 {
                 spans.push(Span::styled("  ", Style::new().fg(BORDER)));
             }
-            spans.push(Span::styled(
-                (*value).to_string(),
-                Style::new().fg(Color::Yellow),
-            ));
+            // The highlighted one is what the right arrow will take.
+            let style = if start + i == input.choice {
+                Style::new()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                Style::new().fg(Color::Yellow)
+            };
+            spans.push(Span::styled((*value).to_string(), style));
         }
         lines.push(Line::from(spans));
     }
-    let title = if matches.is_empty() {
-        "enter confirm   esc cancel"
-    } else {
-        "tab suggest   enter confirm   esc cancel"
-    };
-    draw_prompt_lines(f, lines, title, None);
+    lines.push(Line::from(Span::styled(
+        "↑↓ suggest   tab next   → accept   enter save   esc cancel",
+        Style::new().fg(BORDER),
+    )));
+    draw_prompt_lines(f, lines, input.heading(), None);
 }
 
 fn draw_prompt(f: &mut Frame, title: &str, text: &str, color: Option<Color>) {

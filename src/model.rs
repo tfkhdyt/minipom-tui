@@ -146,6 +146,15 @@ impl Data {
         self.entries.retain(|e| e.task_id != id);
     }
 
+    /// Deletes every completed task with its logged time. Returns how many went.
+    pub fn remove_done(&mut self) -> usize {
+        let before = self.tasks.len();
+        self.tasks.retain(|t| !t.done);
+        let remaining: BTreeSet<u64> = self.tasks.iter().map(|t| t.id).collect();
+        self.entries.retain(|e| remaining.contains(&e.task_id));
+        before - self.tasks.len()
+    }
+
     pub fn pomodoros_on(&self, day: NaiveDate) -> u32 {
         self.pomodoros.get(&day.to_string()).copied().unwrap_or(0)
     }
@@ -280,6 +289,32 @@ mod tests {
             },
         ]);
         assert_eq!(d.totals_by_project(today), vec![("work".to_string(), 3600)]);
+    }
+
+    #[test]
+    fn remove_done_drops_completed_tasks_and_their_entries() {
+        let mut d = Data::default();
+        let keep = d.add_task("keep".into());
+        let done = d.add_task("done".into());
+        d.task_mut(done).unwrap().done = true;
+        d.entries = vec![
+            Entry {
+                task_id: done,
+                start: 0,
+                end: 60,
+            },
+            Entry {
+                task_id: keep,
+                start: 0,
+                end: 30,
+            },
+        ];
+
+        assert_eq!(d.remove_done(), 1);
+        assert_eq!(d.ordered(), vec![keep]);
+        assert_eq!(d.total_seconds(done), 0);
+        assert_eq!(d.total_seconds(keep), 30);
+        assert_eq!(d.remove_done(), 0);
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub struct App {
     /// Task the running pomodoro is credited to.
     pub active: Option<u64>,
     pub input: Option<Input>,
-    pub confirm_delete: Option<u64>,
+    pub confirm_delete: Option<Confirm>,
     pub status: String,
     pub today: NaiveDate,
     pub should_quit: bool,
@@ -31,40 +31,107 @@ struct OpenEntry {
     start: i64,
 }
 
+/// What a pending `d`/`D` is waiting for a yes on.
 #[derive(Clone, Copy)]
-pub enum Prompt {
-    NewTask,
-    Title(u64),
-    Project(u64),
-    Tags(u64),
+pub enum Confirm {
+    One(u64),
+    Completed,
+}
+
+/// One field of the add/edit form. The form shows all three at once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Field {
+    Title,
+    Project,
+    Tags,
+}
+
+impl Field {
+    pub fn label(self) -> &'static str {
+        match self {
+            Field::Title => "title",
+            Field::Project => "project",
+            Field::Tags => "tags",
+        }
+    }
+
+    /// Next field for a tab, wrapping at both ends.
+    fn shift(self, delta: isize) -> Self {
+        const FIELDS: [Field; 3] = [Field::Title, Field::Project, Field::Tags];
+        let i = FIELDS.iter().position(|f| *f == self).unwrap_or(0) as isize;
+        FIELDS[(i + delta).rem_euclid(FIELDS.len() as isize) as usize]
+    }
+}
+
+/// The text of the whole form. Nothing is written to the store until the form
+/// is saved, so escaping out leaves the task as it was.
+#[derive(Default)]
+pub struct Draft {
+    /// `None` adds a task; `Some` edits that one.
+    id: Option<u64>,
+    title: String,
+    project: String,
+    tags: String,
 }
 
 pub struct Input {
-    pub prompt: String,
-    pub target: Prompt,
-    pub buf: String,
-    /// Existing values for this field, drawn from the stored tasks.
-    pub suggestions: Vec<String>,
+    pub field: Field,
+    draft: Draft,
+    /// Existing values, drawn from the stored tasks, per suggestion field.
+    projects: Vec<String>,
+    tags: Vec<String>,
+    /// Which match `→` will take.
+    pub choice: usize,
 }
 
 impl Input {
+    pub fn value(&self, field: Field) -> &str {
+        match field {
+            Field::Title => &self.draft.title,
+            Field::Project => &self.draft.project,
+            Field::Tags => &self.draft.tags,
+        }
+    }
+
+    fn value_mut(&mut self) -> &mut String {
+        match self.field {
+            Field::Title => &mut self.draft.title,
+            Field::Project => &mut self.draft.project,
+            Field::Tags => &mut self.draft.tags,
+        }
+    }
+
+    pub fn heading(&self) -> &'static str {
+        if self.draft.id.is_some() {
+            "Edit task"
+        } else {
+            "Add task"
+        }
+    }
+
     /// The piece being typed: the last comma-separated part for tags.
     fn token(&self) -> &str {
-        match self.target {
-            Prompt::Tags(_) => self.buf.rsplit(',').next().unwrap_or("").trim(),
-            _ => self.buf.trim(),
+        let value = self.value(self.field).trim();
+        match self.field {
+            Field::Tags => value.rsplit(',').next().unwrap_or("").trim(),
+            _ => value,
         }
     }
 
     /// Existing values that extend what is typed, minus tags already listed.
     pub fn matches(&self) -> Vec<&str> {
+        let suggestions = match self.field {
+            Field::Title => return Vec::new(),
+            Field::Project => &self.projects,
+            Field::Tags => &self.tags,
+        };
         let token = self.token().to_lowercase();
-        let listed: Vec<&str> = if matches!(self.target, Prompt::Tags(_)) {
-            self.buf.split(',').map(str::trim).collect()
+        let listed: Vec<&str> = if self.field == Field::Tags {
+            self.value(self.field).split(',').map(str::trim).collect()
         } else {
             Vec::new()
         };
-        self.suggestions
+        suggestions
             .iter()
             .filter(|s| {
                 let lower = s.to_lowercase();
@@ -76,9 +143,9 @@ impl Input {
 
     /// Replaces the token being typed with `value`, appending for a new tag.
     fn apply(&mut self, value: &str) {
-        if matches!(self.target, Prompt::Tags(_)) {
+        if self.field == Field::Tags {
             let mut parts: Vec<String> = self
-                .buf
+                .value(self.field)
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
@@ -88,15 +155,33 @@ impl Input {
                 parts.pop();
             }
             parts.push(value.to_string());
-            self.buf = parts.join(", ");
+            *self.value_mut() = parts.join(", ");
         } else {
-            self.buf = value.to_string();
+            *self.value_mut() = value.to_string();
+        }
+        self.choice = 0;
+    }
+
+    /// Moves the highlighted suggestion, wrapping at both ends.
+    fn cycle_choice(&mut self, delta: isize) {
+        let len = self.matches().len();
+        if len == 0 {
+            self.choice = 0;
+            return;
+        }
+        self.choice = (self.choice as isize + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Takes the highlighted suggestion, if there is one.
+    fn apply_choice(&mut self) {
+        if let Some(value) = self.matches().get(self.choice).map(|s| s.to_string()) {
+            self.apply(&value);
         }
     }
 }
 
 pub const HELP: &str =
-    "a add  e edit  p project  t tags  d del  space done  s start/pause  x reset  n skip  q quit";
+    "a add  e edit  d del  D clear done  space done  s start/pause  x reset  n skip  q quit";
 
 /// How long a status message stays before the key list comes back.
 const STATUS_LINGER: Duration = Duration::from_secs(4);
@@ -289,69 +374,72 @@ impl App {
 
     // ---- inputs --------------------------------------------------------
 
-    fn open_input(&mut self, prompt: &str, target: Prompt, prefill: String) {
-        let suggestions = match target {
-            Prompt::Project(_) => self.data.projects(),
-            Prompt::Tags(_) => self.data.tags(),
-            _ => Vec::new(),
-        };
+    fn open_form(&mut self, draft: Draft) {
         self.input = Some(Input {
-            prompt: prompt.into(),
-            target,
-            buf: prefill,
-            suggestions,
+            field: Field::Title,
+            draft,
+            projects: self.data.projects(),
+            tags: self.data.tags(),
+            choice: 0,
         });
     }
 
+    fn focus_field(&mut self, delta: isize) {
+        if let Some(input) = self.input.as_mut() {
+            input.field = input.field.shift(delta);
+            input.choice = 0;
+        }
+    }
+
     fn submit_input(&mut self) {
+        // Keep the form open so the title can be fixed in place.
+        let Some(input) = self.input.as_ref() else {
+            return;
+        };
+        if input.draft.title.trim().is_empty() {
+            self.set_status("title cannot be empty");
+            return;
+        }
         let Some(input) = self.input.take() else {
             return;
         };
-        let text = input.buf.trim().to_string();
-        match input.target {
-            Prompt::NewTask => {
-                if text.is_empty() {
-                    self.set_status("empty task ignored");
-                    return;
-                }
-                let id = self.data.add_task(text.clone());
+        self.commit(input.draft);
+    }
+
+    /// Writes the finished form: adds a task, or replaces the edited one.
+    fn commit(&mut self, draft: Draft) {
+        let title = draft.title.trim().to_string();
+        let project = draft.project.trim();
+        let project = (!project.is_empty()).then(|| project.to_string());
+        let mut tags: Vec<String> = Vec::new();
+        for tag in draft
+            .tags
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !tags.iter().any(|t| t == tag) {
+                tags.push(tag.to_string());
+            }
+        }
+        let id = match draft.id {
+            Some(id) => id,
+            None => {
+                let id = self.data.add_task(title.clone());
                 self.selected = Some(id);
-                self.set_status(format!("added {text}"));
+                self.set_status(format!("added {title}"));
+                id
             }
-            Prompt::Title(id) => {
-                if text.is_empty() {
-                    self.set_status("title cannot be empty");
-                    return;
-                }
-                if let Some(t) = self.data.task_mut(id) {
-                    t.title = text;
-                }
-            }
-            Prompt::Project(id) => {
-                if let Some(t) = self.data.task_mut(id) {
-                    // An empty answer detaches the task from its project.
-                    t.project = Some(text).filter(|s| !s.is_empty());
-                }
-            }
-            Prompt::Tags(id) => {
-                let mut tags: Vec<String> = Vec::new();
-                for tag in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                    if !tags.iter().any(|t| t == tag) {
-                        tags.push(tag.to_string());
-                    }
-                }
-                if let Some(t) = self.data.task_mut(id) {
-                    t.tags = tags;
-                }
-            }
+        };
+        if let Some(t) = self.data.task_mut(id) {
+            t.title = title;
+            t.project = project;
+            t.tags = tags;
         }
         self.persist();
     }
 
-    fn delete_selected(&mut self) {
-        let Some(id) = self.confirm_delete.take() else {
-            return;
-        };
+    fn delete_task(&mut self, id: u64) {
         let index = self.selected_index();
         self.data.remove_task(id);
         if self.active == Some(id) {
@@ -367,6 +455,29 @@ impl App {
         self.set_status("task deleted");
     }
 
+    fn delete_completed(&mut self) {
+        let index = self.selected_index().unwrap_or(0);
+        if self
+            .active
+            .is_some_and(|id| self.data.task(id).is_some_and(|t| t.done))
+        {
+            self.close_entry();
+            self.active = None;
+        }
+        let removed = self.data.remove_done();
+        let ordered = self.data.ordered();
+        if self.selected.is_none_or(|id| !ordered.contains(&id)) {
+            self.selected = ordered
+                .get(index.min(ordered.len().saturating_sub(1)))
+                .copied();
+        }
+        self.persist();
+        match removed {
+            0 => self.set_status("no completed tasks"),
+            n => self.set_status(format!("deleted {n} completed task(s)")),
+        }
+    }
+
     // ---- events --------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
@@ -380,31 +491,51 @@ impl App {
     }
 
     fn on_key_confirm(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => self.delete_selected(),
-            _ => {
-                self.confirm_delete = None;
-                self.set_status("delete cancelled");
+        let Some(confirm) = self.confirm_delete.take() else {
+            return;
+        };
+        match (key.code, confirm) {
+            (KeyCode::Char('y') | KeyCode::Char('Y'), Confirm::One(id)) => self.delete_task(id),
+            (KeyCode::Char('y') | KeyCode::Char('Y'), Confirm::Completed) => {
+                self.delete_completed()
             }
+            _ => self.set_status("delete cancelled"),
         }
     }
 
     fn on_key_input(&mut self, key: KeyEvent) {
-        let Some(input) = self.input.as_mut() else {
-            return;
-        };
         match key.code {
             KeyCode::Esc => self.input = None,
             KeyCode::Enter => self.submit_input(),
-            KeyCode::Tab => {
-                if let Some(value) = input.matches().first().map(|s| s.to_string()) {
-                    input.apply(&value);
+            KeyCode::Tab => self.focus_field(1),
+            KeyCode::BackTab => self.focus_field(-1),
+            KeyCode::Down => {
+                if let Some(input) = self.input.as_mut() {
+                    input.cycle_choice(1);
+                }
+            }
+            KeyCode::Up => {
+                if let Some(input) = self.input.as_mut() {
+                    input.cycle_choice(-1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(input) = self.input.as_mut() {
+                    input.apply_choice();
                 }
             }
             KeyCode::Backspace => {
-                input.buf.pop();
+                if let Some(input) = self.input.as_mut() {
+                    input.value_mut().pop();
+                    input.choice = 0;
+                }
             }
-            KeyCode::Char(c) => input.buf.push(c),
+            KeyCode::Char(c) => {
+                if let Some(input) = self.input.as_mut() {
+                    input.value_mut().push(c);
+                    input.choice = 0;
+                }
+            }
             _ => {}
         }
     }
@@ -416,17 +547,31 @@ impl App {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
-            KeyCode::Char('a') => self.open_input("new task", Prompt::NewTask, String::new()),
-            KeyCode::Char('e') => self.edit_selected(Prompt::Title, "title", |t| t.title.clone()),
-            KeyCode::Char('p') => self.edit_selected(Prompt::Project, "project", |t| {
-                t.project.clone().unwrap_or_default()
-            }),
-            KeyCode::Char('t') => self.edit_selected(Prompt::Tags, "tags (comma separated)", |t| {
-                t.tags.join(", ")
-            }),
+            KeyCode::Char('a') => self.open_form(Draft::default()),
+            KeyCode::Char('e') => {
+                let draft = self
+                    .selected_task_id()
+                    .and_then(|id| self.data.task(id))
+                    .map(|t| Draft {
+                        id: Some(t.id),
+                        title: t.title.clone(),
+                        project: t.project.clone().unwrap_or_default(),
+                        tags: t.tags.join(", "),
+                    });
+                if let Some(draft) = draft {
+                    self.open_form(draft);
+                }
+            }
             KeyCode::Char('d') => {
                 if let Some(id) = self.selected_task_id() {
-                    self.confirm_delete = Some(id);
+                    self.confirm_delete = Some(Confirm::One(id));
+                }
+            }
+            KeyCode::Char('D') => {
+                if self.data.tasks.iter().any(|t| t.done) {
+                    self.confirm_delete = Some(Confirm::Completed);
+                } else {
+                    self.set_status("no completed tasks");
                 }
             }
             KeyCode::Char(' ') | KeyCode::Enter => {
@@ -448,23 +593,6 @@ impl App {
             KeyCode::Char('?') => self.set_status(HELP),
             _ => {}
         }
-    }
-
-    /// Opens the one-line editor for the selected task, prefilled from `get`.
-    fn edit_selected(
-        &mut self,
-        target: fn(u64) -> Prompt,
-        prompt: &str,
-        get: fn(&crate::model::Task) -> String,
-    ) {
-        let Some(id) = self.selected_task_id() else {
-            return;
-        };
-        let Some(task) = self.data.task(id) else {
-            return;
-        };
-        let prefill = get(task);
-        self.open_input(prompt, target(id), prefill);
     }
 
     // ---- periodic ------------------------------------------------------
@@ -652,7 +780,7 @@ mod tests {
             selected: Some(b),
             active: None,
             input: None,
-            confirm_delete: Some(b),
+            confirm_delete: None,
             status: String::new(),
             today: Local::now().date_naive(),
             should_quit: false,
@@ -660,22 +788,44 @@ mod tests {
             status_expiry: None,
         };
 
-        app.delete_selected();
+        app.delete_task(b);
         assert_eq!(app.selected, Some(c), "the row below takes its place");
 
         app.selected = Some(c);
-        app.confirm_delete = Some(c);
-        app.delete_selected();
+        app.delete_task(c);
         assert_eq!(app.selected, Some(a), "the row above is used at the tail");
 
         app.selected = Some(a);
-        app.confirm_delete = Some(a);
-        app.delete_selected();
+        app.delete_task(a);
         assert_eq!(app.selected, None, "an empty list has nothing to select");
     }
 
     #[test]
-    fn suggestions_complete_projects_and_append_tags() {
+    fn clearing_completed_tasks_keeps_the_selection_and_drops_the_clock() {
+        std::env::set_var(
+            "XDG_DATA_HOME",
+            std::env::temp_dir().join("minipom-tui-test"),
+        );
+
+        let (mut app, id) = app_with_task();
+        app.data.task_mut(id).unwrap().done = true;
+        let open = app.data.add_task("still open".into());
+        app.confirm_delete = Some(Confirm::Completed);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.data.task(id).is_none(), "the done task is gone");
+        assert!(app.active.is_none(), "its clock is unbound");
+        assert_eq!(app.selected, Some(open), "selection lands on a live task");
+        assert_eq!(app.data.remove_done(), 0);
+    }
+
+    #[test]
+    fn add_and_edit_collect_title_project_and_tags() {
+        std::env::set_var(
+            "XDG_DATA_HOME",
+            std::env::temp_dir().join("minipom-tui-test"),
+        );
+
         let mut app = App {
             data: Data::default(),
             timer: Timer::new(Default::default()),
@@ -696,28 +846,125 @@ mod tests {
         app.data.task_mut(b).unwrap().project = Some("home".into());
         app.selected = Some(b);
 
-        // Projects: typing narrows, Tab fills the whole value.
-        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
-        app.input.as_mut().unwrap().buf.clear();
+        // Add: all three fields are on screen, tab moves between them.
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        // An empty title is refused without closing the form.
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.input.is_some(), "the form stays open to fix the title");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().field, Field::Title);
+        for c in "new".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().field, Field::Project);
         app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
         assert_eq!(app.input.as_ref().unwrap().matches(), vec!["work"]);
+        // Right accepts the suggestion; tab moves on.
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value(Field::Project), "work");
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(app.input.as_ref().unwrap().buf, "work");
+        assert_eq!(app.input.as_ref().unwrap().field, Field::Tags);
 
-        // Tags: Tab appends to what is already listed, and drops used tags.
-        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
-        let input = app.input.as_mut().unwrap();
-        input.buf = "urgent, de".into();
-        assert_eq!(input.matches(), vec!["deep"]);
-        let value = input.matches()[0].to_string();
-        input.apply(&value);
-        assert_eq!(input.buf, "urgent, deep");
-        input.buf.push_str(", z");
-        assert!(
-            input.matches().is_empty(),
-            "used tags are not offered again"
+        // Tags: accepting a suggestion appends to what is already listed.
+        for c in "urgent, de".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.input.as_ref().unwrap().matches(), vec!["deep"]);
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            app.input.as_ref().unwrap().value(Field::Tags),
+            "urgent, deep"
         );
+        // A listed tag is not offered again.
+        for c in ", z".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(app.input.as_ref().unwrap().matches().is_empty());
+        for _ in 0..3 {
+            app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.input.is_none(), "saving closes the form");
+
+        let added = app
+            .data
+            .ordered()
+            .into_iter()
+            .find(|id| *id != a && *id != b);
+        let added = app.data.task(added.unwrap()).unwrap();
+        assert_eq!(added.title, "new");
+        assert_eq!(added.project.as_deref(), Some("work"));
+        assert_eq!(added.tags, vec!["urgent", "deep"]);
+
+        // Edit prefills every field; escaping keeps the stored task untouched.
+        app.selected = Some(a);
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        let input = app.input.as_ref().unwrap();
+        assert_eq!(input.value(Field::Title), "a");
+        assert_eq!(input.value(Field::Project), "work");
+        assert_eq!(input.value(Field::Tags), "deep, urgent");
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().field, Field::Project);
+        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().field, Field::Title);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.data.task(a).unwrap().title, "a");
+        assert_eq!(app.data.task(a).unwrap().project.as_deref(), Some("work"));
+        assert_eq!(app.data.task(a).unwrap().tags, vec!["deep", "urgent"]);
+    }
+
+    #[test]
+    fn suggestion_choice_wraps_and_accepts_the_highlighted_one() {
+        let mut app = App {
+            data: Data::default(),
+            timer: Timer::new(Default::default()),
+            selected: None,
+            active: None,
+            input: None,
+            confirm_delete: None,
+            status: String::new(),
+            today: Local::now().date_naive(),
+            should_quit: false,
+            open: None,
+            status_expiry: None,
+        };
+        let seed = app.data.add_task("seed".into());
+        app.data.task_mut(seed).unwrap().tags = vec!["deep".into(), "design".into(), "docs".into()];
+
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(
+            app.input.as_ref().unwrap().matches(),
+            vec!["deep", "design", "docs"]
+        );
+        assert_eq!(app.input.as_ref().unwrap().choice, 0);
+
+        // Down walks the list and wraps; Up walks back.
+        for expected in [1, 2, 0] {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            assert_eq!(app.input.as_ref().unwrap().choice, expected);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().choice, 2);
+
+        // Typing restarts from the first match.
+        app.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().choice, 0);
+        assert_eq!(
+            app.input.as_ref().unwrap().matches(),
+            vec!["deep", "design"]
+        );
+
+        // The right arrow takes the highlighted one, not always the first.
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value(Field::Tags), "design");
+        assert_eq!(app.input.as_ref().unwrap().choice, 0);
     }
 
     #[test]
