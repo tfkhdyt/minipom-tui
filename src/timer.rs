@@ -147,7 +147,8 @@ impl Timer {
         self.switch(next);
     }
 
-    /// Puts the current phase back to full length and starts the cycle over.
+    /// Puts the current phase back to full length and clears the cycle dots.
+    /// The phase itself is kept, so resetting mid-break stays in that break.
     pub fn reset(&mut self) {
         self.running = false;
         self.remaining = self.total();
@@ -228,7 +229,11 @@ mod tests {
 
         t.reset();
         assert_eq!(t.work_done, 0, "the dots go back to empty");
-        assert_eq!(t.remaining, t.total());
+        assert_eq!(
+            t.remaining,
+            Duration::from_secs(30),
+            "the long break is full length again"
+        );
         assert!(!t.running);
         assert_eq!(t.pomodoros, 2, "today's count is not a reset");
     }

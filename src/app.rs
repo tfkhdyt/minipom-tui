@@ -362,6 +362,7 @@ impl App {
         self.close_entry();
         self.timer.reset();
         self.active = None;
+        self.persist();
         self.set_status("timer reset");
     }
 
