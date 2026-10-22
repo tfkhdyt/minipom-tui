@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use std::time::Instant;
 
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
@@ -552,17 +552,32 @@ fn draw_input(f: &mut Frame, input: &Input) {
             } else {
                 Style::new().fg(BORDER)
             };
-            let mut spans = vec![
-                Span::styled(format!("{:<8}", field.label()), label_style),
-                Span::styled(input.value(field).to_string(), Style::new().fg(TEXT)),
-            ];
+            let value = input.value(field);
+            let mut spans = vec![Span::styled(format!("{:<8}", field.label()), label_style)];
             if focused {
-                spans.push(Span::styled(
-                    "_",
-                    Style::new()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::SLOW_BLINK),
-                ));
+                // A block cursor sits on the cell under the caret, so moving it
+                // never shifts the text. At the end it covers a trailing space.
+                let at = input.cursor.min(value.len());
+                let cursor_style = Style::new()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::SLOW_BLINK);
+                match value[at..].chars().next() {
+                    Some(ch) => {
+                        spans.push(Span::styled(value[..at].to_string(), Style::new().fg(TEXT)));
+                        spans.push(Span::styled(ch.to_string(), cursor_style));
+                        spans.push(Span::styled(
+                            value[at + ch.len_utf8()..].to_string(),
+                            Style::new().fg(TEXT),
+                        ));
+                    }
+                    None => {
+                        spans.push(Span::styled(value.to_string(), Style::new().fg(TEXT)));
+                        spans.push(Span::styled(" ", cursor_style));
+                    }
+                }
+            } else {
+                spans.push(Span::styled(value.to_string(), Style::new().fg(TEXT)));
             }
             Line::from(spans)
         })
@@ -572,12 +587,12 @@ fn draw_input(f: &mut Frame, input: &Input) {
     if !matches.is_empty() {
         // Four per page, following the highlighted one when it moves past them.
         let start = input.choice / 4 * 4;
-        let mut spans = vec![Span::styled("→ ", Style::new().fg(BORDER))];
+        let mut spans = vec![Span::styled("› ", Style::new().fg(BORDER))];
         for (i, value) in matches.iter().skip(start).take(4).enumerate() {
             if i > 0 {
                 spans.push(Span::styled("  ", Style::new().fg(BORDER)));
             }
-            // The highlighted one is what the right arrow will take.
+            // The highlighted one is what tab will take.
             let style = if start + i == input.choice {
                 Style::new()
                     .fg(Color::Yellow)
@@ -590,7 +605,11 @@ fn draw_input(f: &mut Frame, input: &Input) {
         lines.push(Line::from(spans));
     }
     lines.push(Line::from(Span::styled(
-        "↑↓ suggest   tab next   → accept   enter save   esc cancel",
+        if matches.is_empty() {
+            "↓↑ switch field   enter save   esc cancel"
+        } else {
+            "←→ suggest   ↓↑ switch field   tab accept   enter save   esc cancel"
+        },
         Style::new().fg(BORDER),
     )));
     draw_prompt_lines(f, lines, input.heading(), None);

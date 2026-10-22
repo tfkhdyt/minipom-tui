@@ -55,7 +55,7 @@ impl Field {
         }
     }
 
-    /// Next field for a tab, wrapping at both ends.
+    /// Next field for the down/up keys, wrapping at both ends.
     fn shift(self, delta: isize) -> Self {
         const FIELDS: [Field; 3] = [Field::Title, Field::Project, Field::Tags];
         let i = FIELDS.iter().position(|f| *f == self).unwrap_or(0) as isize;
@@ -80,8 +80,10 @@ pub struct Input {
     /// Existing values, drawn from the stored tasks, per suggestion field.
     projects: Vec<String>,
     tags: Vec<String>,
-    /// Which match `→` will take.
+    /// Which match `tab` will take.
     pub choice: usize,
+    /// Byte offset of the text cursor within the focused field.
+    pub cursor: usize,
 }
 
 impl Input {
@@ -141,6 +143,32 @@ impl Input {
             .collect()
     }
 
+    /// Whether left/right can pick a suggestion right now.
+    fn suggestible(&self) -> bool {
+        self.field != Field::Title && !self.matches().is_empty()
+    }
+
+    /// Moves the text cursor by one character, staying inside the value.
+    fn move_cursor(&mut self, delta: isize) {
+        let next = {
+            let text = self.value(self.field);
+            if delta < 0 {
+                text[..self.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+            } else {
+                text[self.cursor..]
+                    .chars()
+                    .next()
+                    .map(|c| self.cursor + c.len_utf8())
+            }
+        };
+        if let Some(next) = next {
+            self.cursor = next;
+        }
+    }
+
     /// Replaces the token being typed with `value`, appending for a new tag.
     fn apply(&mut self, value: &str) {
         if self.field == Field::Tags {
@@ -160,6 +188,7 @@ impl Input {
             *self.value_mut() = value.to_string();
         }
         self.choice = 0;
+        self.cursor = self.value(self.field).len();
     }
 
     /// Moves the highlighted suggestion, wrapping at both ends.
@@ -376,12 +405,14 @@ impl App {
     // ---- inputs --------------------------------------------------------
 
     fn open_form(&mut self, draft: Draft) {
+        let cursor = draft.title.len();
         self.input = Some(Input {
             field: Field::Title,
             draft,
             projects: self.data.projects(),
             tags: self.data.tags(),
             choice: 0,
+            cursor,
         });
     }
 
@@ -389,6 +420,7 @@ impl App {
         if let Some(input) = self.input.as_mut() {
             input.field = input.field.shift(delta);
             input.choice = 0;
+            input.cursor = input.value(input.field).len();
         }
     }
 
@@ -508,32 +540,51 @@ impl App {
         match key.code {
             KeyCode::Esc => self.input = None,
             KeyCode::Enter => self.submit_input(),
-            KeyCode::Tab => self.focus_field(1),
-            KeyCode::BackTab => self.focus_field(-1),
-            KeyCode::Down => {
-                if let Some(input) = self.input.as_mut() {
-                    input.cycle_choice(1);
-                }
-            }
-            KeyCode::Up => {
-                if let Some(input) = self.input.as_mut() {
-                    input.cycle_choice(-1);
-                }
-            }
-            KeyCode::Right => {
+            KeyCode::Tab => {
                 if let Some(input) = self.input.as_mut() {
                     input.apply_choice();
                 }
             }
+            KeyCode::BackTab => self.focus_field(-1),
+            KeyCode::Down => self.focus_field(1),
+            KeyCode::Up => self.focus_field(-1),
+            KeyCode::Left => {
+                if let Some(input) = self.input.as_mut() {
+                    if input.suggestible() {
+                        input.cycle_choice(-1);
+                    } else {
+                        input.move_cursor(-1);
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(input) = self.input.as_mut() {
+                    if input.suggestible() {
+                        input.cycle_choice(1);
+                    } else {
+                        input.move_cursor(1);
+                    }
+                }
+            }
             KeyCode::Backspace => {
                 if let Some(input) = self.input.as_mut() {
-                    input.value_mut().pop();
-                    input.choice = 0;
+                    let at = input.cursor;
+                    let prev = input.value(input.field)[..at]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i);
+                    if let Some(prev) = prev {
+                        input.value_mut().remove(prev);
+                        input.cursor = prev;
+                        input.choice = 0;
+                    }
                 }
             }
             KeyCode::Char(c) => {
                 if let Some(input) = self.input.as_mut() {
-                    input.value_mut().push(c);
+                    let at = input.cursor;
+                    input.value_mut().insert(at, c);
+                    input.cursor = at + c.len_utf8();
                     input.choice = 0;
                 }
             }
@@ -848,7 +899,7 @@ mod tests {
         app.data.task_mut(b).unwrap().project = Some("home".into());
         app.selected = Some(b);
 
-        // Add: all three fields are on screen, tab moves between them.
+        // Add: all three fields are on screen, up/down moves between them.
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
         // An empty title is refused without closing the form.
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -860,14 +911,14 @@ mod tests {
         for c in "new".chars() {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.input.as_ref().unwrap().field, Field::Project);
         app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
         assert_eq!(app.input.as_ref().unwrap().matches(), vec!["work"]);
-        // Right accepts the suggestion; tab moves on.
-        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        assert_eq!(app.input.as_ref().unwrap().value(Field::Project), "work");
+        // Tab accepts the suggestion; down moves on.
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value(Field::Project), "work");
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.input.as_ref().unwrap().field, Field::Tags);
 
         // Tags: accepting a suggestion appends to what is already listed.
@@ -875,7 +926,7 @@ mod tests {
             app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         assert_eq!(app.input.as_ref().unwrap().matches(), vec!["deep"]);
-        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(
             app.input.as_ref().unwrap().value(Field::Tags),
             "urgent, deep"
@@ -908,9 +959,9 @@ mod tests {
         assert_eq!(input.value(Field::Title), "a");
         assert_eq!(input.value(Field::Project), "work");
         assert_eq!(input.value(Field::Tags), "deep, urgent");
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.input.as_ref().unwrap().field, Field::Project);
-        app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.input.as_ref().unwrap().field, Field::Title);
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.data.task(a).unwrap().title, "a");
@@ -937,8 +988,26 @@ mod tests {
         app.data.task_mut(seed).unwrap().tags = vec!["deep".into(), "design".into(), "docs".into()];
 
         app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        // The title has no suggestions, so the arrows move the text cursor
+        // and tab has nothing to accept.
+        for c in "ac".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value(Field::Title), "abc");
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value(Field::Title), "abcd");
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value(Field::Title), "abcd");
+        for _ in 0..4 {
+            app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        assert_eq!(app.input.as_ref().unwrap().value(Field::Title), "");
+        assert_eq!(app.input.as_ref().unwrap().choice, 0);
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         app.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
         assert_eq!(
             app.input.as_ref().unwrap().matches(),
@@ -946,12 +1015,12 @@ mod tests {
         );
         assert_eq!(app.input.as_ref().unwrap().choice, 0);
 
-        // Down walks the list and wraps; Up walks back.
+        // Right walks the list and wraps; Left walks back.
         for expected in [1, 2, 0] {
-            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
             assert_eq!(app.input.as_ref().unwrap().choice, expected);
         }
-        app.on_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         assert_eq!(app.input.as_ref().unwrap().choice, 2);
 
         // Typing restarts from the first match.
@@ -962,11 +1031,19 @@ mod tests {
             vec!["deep", "design"]
         );
 
-        // The right arrow takes the highlighted one, not always the first.
-        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        // Tab takes the highlighted one, not always the first.
         app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(app.input.as_ref().unwrap().value(Field::Tags), "design");
         assert_eq!(app.input.as_ref().unwrap().choice, 0);
+
+        // Nothing matches, so the arrows move the cursor and tab accepts nothing.
+        app.on_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().cursor, 6);
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value(Field::Tags), "designz");
     }
 
     #[test]

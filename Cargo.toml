@@ -10,9 +10,9 @@ keywords = ["pomodoro", "tui", "timer", "time-tracking", "productivity"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-ratatui = { version = "0.29", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
 # display width of a character, so the marquee cuts text at cell boundaries
-unicode-width = "0.2"
+unicode-width = "0.2.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # local wall-clock dates for the "today" rollup; std has no timezone support

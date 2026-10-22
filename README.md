@@ -39,9 +39,9 @@ Then run `minipom-tui`.
 | `j` / `k`, arrows | move the cursor                                              |
 | `a`               | add a task (title, project, tags in one dialog)              |
 | `e`               | edit the selected task in the same dialog                    |
-| `tab`             | in the task dialog, move to the next field                   |
-| `↑` / `↓`         | in the task dialog, choose among suggested values            |
-| `→`               | in the task dialog, accept the highlighted suggestion        |
+| `↓` / `↑`         | in the task dialog, move to the next or previous field       |
+| `←` / `→`         | in the task dialog, choose among suggestions, else move the cursor |
+| `tab`             | in the task dialog, accept the highlighted suggestion        |
 | `d`               | delete the selected task (asks first)                        |
 | `D`               | delete every completed task (asks first)                     |
 | `space` / `enter` | mark done / undone                                           |
@@ -55,9 +55,10 @@ Starting the timer binds it to the task under the cursor. To switch tasks
 mid-session, move the cursor first and press `s` again.
 
 Add and edit open one dialog with the title, project (leave it empty for none)
-and tags (comma separated) on screen together. `tab` moves between fields, `↑`/`↓`
-highlight a suggestion, `→` accepts it, `enter` saves and `esc` discards
-everything.
+and tags (comma separated) on screen together. `↓`/`↑` move between fields,
+`←`/`→` highlight a suggestion, `tab` accepts it, `enter` saves and `esc`
+discards everything. When no value matches, the arrows move the text cursor
+instead and `tab` does nothing.
 
 The key list sits in the bottom row and stays there. Status messages appear on
 the row below it for 4 seconds, so a toast never hides the keys.
