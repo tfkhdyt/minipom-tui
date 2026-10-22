@@ -11,7 +11,10 @@ A pomodoro timer, task list and time tracker that runs in the terminal.
   tasks last inside their project and tags shown inline.
 - **Time tracking** - every work phase is logged against the task you started it
   on. Breaks are never logged. The side panel totals today's time per project.
-- **Resume** - the clock and the day's pomodoro count survive a restart.
+  The task and Today timers read the same clock as the countdown, so pausing
+  the pomodoro pauses the tracker too.
+- **Resume** - the clock, the in-progress focus stretch and the day's pomodoro
+  count survive a restart.
 - **One file of data** - plain JSON, written on every change.
 
 ## Install

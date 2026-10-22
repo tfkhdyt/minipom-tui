@@ -31,6 +31,17 @@ pub struct Entry {
     pub end: i64,
 }
 
+/// A focus stretch that has not been written to the log yet. Kept with the
+/// clock so a restart can credit the same seconds the countdown gave up.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug)]
+pub struct OpenEntry {
+    pub task_id: u64,
+    /// Unix second the stretch began, used as the logged entry's start.
+    pub start: i64,
+    /// Whole seconds the phase had already run when this stretch began.
+    pub base_secs: u64,
+}
+
 /// The clock's position at the last save. `None` on a fresh store.
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct TimerState {
@@ -41,6 +52,9 @@ pub struct TimerState {
     pub running: bool,
     /// Unix seconds when the snapshot was taken, so closed time can be counted.
     pub saved_at: i64,
+    /// The stretch in progress, so tracked time resumes with the clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open: Option<OpenEntry>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -339,6 +353,11 @@ mod tests {
                 work_done: 4,
                 running: true,
                 saved_at: 42,
+                open: Some(OpenEntry {
+                    task_id: 7,
+                    start: 40,
+                    base_secs: 30,
+                }),
             }),
             ..Data::default()
         };
@@ -347,9 +366,19 @@ mod tests {
         assert_eq!(back.phase, Phase::ShortBreak);
         assert_eq!(back.remaining_secs, 123);
         assert_eq!(back.work_done, 4);
+        let open = back.open.unwrap();
+        assert_eq!(open.task_id, 7);
+        assert_eq!(open.start, 40);
+        assert_eq!(open.base_secs, 30);
 
+        // States written before the open stretch existed still load.
         let old: Data = serde_json::from_str("{\"tasks\":[]}").unwrap();
         assert!(old.timer.is_none());
+        let old: Data = serde_json::from_str(
+            "{\"timer\":{\"phase\":\"Work\",\"remaining_secs\":1,\"work_done\":0,\"running\":false,\"saved_at\":0}}",
+        )
+        .unwrap();
+        assert!(old.timer.unwrap().open.is_none());
     }
 
     #[test]

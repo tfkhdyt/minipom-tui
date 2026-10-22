@@ -77,6 +77,12 @@ impl Timer {
         }
     }
 
+    /// Time already spent in the current phase. This is the source the time
+    /// tracker reads, so paused time never adds to a task.
+    pub fn elapsed(&self) -> Duration {
+        self.total().saturating_sub(self.remaining)
+    }
+
     /// Fraction of the current phase already elapsed, for the progress bar.
     pub fn progress(&self) -> f64 {
         let total = self.total().as_secs_f64();
@@ -168,6 +174,17 @@ mod tests {
             long_break: Duration::from_secs(30),
             long_every: 2,
         }
+    }
+
+    #[test]
+    fn elapsed_complements_remaining() {
+        let mut t = Timer::new(quick());
+        assert_eq!(t.elapsed(), Duration::ZERO);
+        t.remaining = Duration::from_secs(4);
+        assert_eq!(t.elapsed(), Duration::from_secs(6));
+        // Remaining can never be negative, so elapsed never passes the total.
+        t.remaining = Duration::ZERO;
+        assert_eq!(t.elapsed(), t.total());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use chrono::{Local, NaiveDate};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-use crate::model::{now_epoch, Data, Entry, TimerState};
+use crate::model::{now_epoch, Data, Entry, OpenEntry, TimerState};
 use crate::timer::{Phase, Timer};
 
 pub struct App {
@@ -20,15 +20,11 @@ pub struct App {
     pub status: String,
     pub today: NaiveDate,
     pub should_quit: bool,
-    /// An hour of focus is written to the log only when it closes.
+    /// A focus stretch not yet written to the log. Its length is read from the
+    /// clock, so the tracker and the countdown can never disagree.
     open: Option<OpenEntry>,
     /// When the status message gives way back to the key list.
     status_expiry: Option<Instant>,
-}
-
-struct OpenEntry {
-    task_id: u64,
-    start: i64,
 }
 
 /// What a pending `d`/`D` is waiting for a yes on.
@@ -240,24 +236,34 @@ impl App {
         // The day's pomodoro count survives a restart.
         timer.pomodoros = data.pomodoros_on(today);
         // Pick the clock back up where the last save left it.
+        let mut active = None;
+        let mut open = None;
         if let Some(state) = data.timer {
             timer.phase = state.phase;
             timer.work_done = state.work_done;
             timer.running = state.running;
             let gap = (now_epoch() - state.saved_at).max(0) as u64;
             timer.remaining = resume_remaining(state, gap, timer.total());
+            // A work stretch that was running at the last save stays bound to
+            // its task, so the tracker counts the same time the clock did.
+            if state.running && state.phase.is_work() {
+                if let Some(entry) = state.open.filter(|e| data.task(e.task_id).is_some()) {
+                    active = Some(entry.task_id);
+                    open = Some(entry);
+                }
+            }
         }
         let mut app = Self {
             data,
             timer,
             selected: None,
-            active: None,
+            active,
             input: None,
             confirm_delete: None,
             status: warning.unwrap_or_else(|| HELP.to_string()),
             today,
             should_quit: false,
-            open: None,
+            open,
             status_expiry: None,
         };
         // Select the first row of the list as the user sees it, not insertion order.
@@ -295,6 +301,7 @@ impl App {
             work_done: self.timer.work_done,
             running: self.timer.running,
             saved_at: now_epoch(),
+            open: self.open,
         });
         if let Err(e) = self.data.save() {
             self.status = format!("save failed: {e}");
@@ -308,29 +315,39 @@ impl App {
     // ---- time tracking -------------------------------------------------
 
     fn open_entry(&mut self) {
-        if self.open.is_some() || !self.timer.phase.is_work() {
+        if self.open.is_some() || !self.timer.running || !self.timer.phase.is_work() {
             return;
         }
         if let Some(id) = self.active {
             self.open = Some(OpenEntry {
                 task_id: id,
                 start: now_epoch(),
+                base_secs: self.timer.elapsed().as_secs(),
             });
         }
     }
 
     fn close_entry(&mut self) {
-        if let Some(entry) = self.open.take() {
-            let end = now_epoch();
-            if end > entry.start {
-                self.data.entries.push(Entry {
-                    task_id: entry.task_id,
-                    start: entry.start,
-                    end,
-                });
-                self.persist();
-            }
+        let Some(entry) = self.open.take() else {
+            return;
+        };
+        // The clock decides how long the stretch was. Using the wall clock
+        // would log time the timer never counted, for example while the
+        // machine was suspended.
+        let secs = self
+            .timer
+            .elapsed()
+            .as_secs()
+            .saturating_sub(entry.base_secs);
+        if secs == 0 {
+            return;
         }
+        self.data.entries.push(Entry {
+            task_id: entry.task_id,
+            start: entry.start,
+            end: entry.start + secs as i64,
+        });
+        self.persist();
     }
 
     // ---- timer controls ------------------------------------------------
@@ -474,11 +491,13 @@ impl App {
 
     fn delete_task(&mut self, id: u64) {
         let index = self.selected_index();
-        self.data.remove_task(id);
         if self.active == Some(id) {
-            self.close_entry();
+            // The time goes with the task; dropping the stretch here avoids
+            // writing an entry for an id that is about to disappear.
+            self.open = None;
             self.active = None;
         }
+        self.data.remove_task(id);
         if self.selected == Some(id) {
             let ordered = self.data.ordered();
             // The row that took its place, or the last one when the tail went.
@@ -681,6 +700,10 @@ impl App {
 
     pub fn quit(&mut self) {
         self.close_entry();
+        // The clock keeps running while the app is closed, so leave a fresh
+        // stretch open. On the next launch it picks up the away time, keeping
+        // the task and Today totals in step with the countdown.
+        self.open_entry();
         self.persist();
     }
 
@@ -713,10 +736,16 @@ impl App {
     }
 
     /// The focus stretch in progress, as (task id, seconds so far). It is not
-    /// in the log yet, so callers add it in to what they display.
+    /// in the log yet, so callers add it in to what they display. The seconds
+    /// come from the pomodoro clock, so every panel shows the same number.
     pub fn live(&self) -> Option<(u64, u64)> {
         let open = self.open.as_ref()?;
-        Some((open.task_id, (now_epoch() - open.start).max(0) as u64))
+        let secs = self
+            .timer
+            .elapsed()
+            .as_secs()
+            .saturating_sub(open.base_secs);
+        Some((open.task_id, secs))
     }
 }
 
@@ -778,6 +807,7 @@ mod tests {
             work_done: 0,
             running,
             saved_at: 0,
+            open: None,
         };
         let total = Duration::from_secs(1500);
 
@@ -801,6 +831,63 @@ mod tests {
             resume_remaining(state(0, false), 0, total),
             Duration::from_secs(1500)
         );
+    }
+
+    #[test]
+    fn live_time_is_the_phase_clock_not_the_wall_clock() {
+        let (mut app, id) = app_with_task();
+        let total = app.timer.total();
+        app.timer.running = true;
+        app.open = Some(OpenEntry {
+            task_id: id,
+            start: 100,
+            base_secs: 0,
+        });
+
+        app.timer.remaining = total - Duration::from_secs(90);
+        assert_eq!(app.live(), Some((id, 90)));
+
+        // A paused clock leaves the tracked number where it was.
+        app.timer.pause();
+        assert_eq!(app.live(), Some((id, 90)));
+
+        // A stretch that opened midway through the phase only counts its own
+        // seconds, so switching tasks cannot credit time twice.
+        app.open = Some(OpenEntry {
+            task_id: id,
+            start: 200,
+            base_secs: 60,
+        });
+        app.timer.remaining = total - Duration::from_secs(120);
+        assert_eq!(app.live(), Some((id, 60)));
+    }
+
+    #[test]
+    fn closing_an_entry_logs_exactly_the_seconds_the_clock_ran() {
+        std::env::set_var(
+            "XDG_DATA_HOME",
+            std::env::temp_dir().join("minipom-tui-test-clock"),
+        );
+
+        let (mut app, id) = app_with_task();
+        let total = app.timer.total();
+        app.timer.running = true;
+        app.open = Some(OpenEntry {
+            task_id: id,
+            start: 1_000,
+            base_secs: 0,
+        });
+
+        // The phase ran out. Logging the wall clock here could add time the
+        // timer never counted, for example after a suspend.
+        app.timer.remaining = Duration::ZERO;
+        app.close_entry();
+
+        let entry = app.data.entries.last().unwrap();
+        assert_eq!(entry.start, 1_000);
+        assert_eq!(entry.end, 1_000 + total.as_secs() as i64);
+        assert_eq!(app.data.total_seconds(id), total.as_secs());
+        assert_eq!(app.live(), None);
     }
 
     #[test]
