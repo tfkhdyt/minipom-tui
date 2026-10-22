@@ -147,10 +147,11 @@ impl Timer {
         self.switch(next);
     }
 
-    /// Puts the current phase back to full length.
+    /// Puts the current phase back to full length and starts the cycle over.
     pub fn reset(&mut self) {
         self.running = false;
         self.remaining = self.total();
+        self.work_done = 0;
         self.last = Instant::now();
     }
 }
@@ -213,5 +214,22 @@ mod tests {
         t.skip();
         assert_eq!(t.pomodoros, 0);
         assert_eq!(t.phase, Phase::ShortBreak);
+    }
+
+    #[test]
+    fn reset_starts_the_cycle_dots_over() {
+        let mut t = Timer::new(quick());
+        t.start(Instant::now());
+        // Work, break, work, and the long break is due.
+        for _ in 0..3 {
+            t.complete();
+        }
+        assert_eq!(t.work_done, 2);
+
+        t.reset();
+        assert_eq!(t.work_done, 0, "the dots go back to empty");
+        assert_eq!(t.remaining, t.total());
+        assert!(!t.running);
+        assert_eq!(t.pomodoros, 2, "today's count is not a reset");
     }
 }
