@@ -584,6 +584,7 @@ impl App {
                     // Finishing the task the clock is credited to ends the session.
                     if done == Some(true) && self.active == Some(id) {
                         self.pause_timer();
+                        self.active = None;
                     }
                     self.persist();
                 }
@@ -990,5 +991,6 @@ mod tests {
         app.data.task_mut(id).unwrap().done = false;
         app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(!app.timer.running, "finishing the clocked task pauses it");
+        assert!(app.active.is_none(), "a finished task is no longer on");
     }
 }
