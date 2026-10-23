@@ -1,6 +1,6 @@
 //! Rendering. Read-only over `App`; every interaction lives in `app.rs`.
 
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
@@ -220,14 +220,29 @@ fn with_live_time(app: &App, totals: &mut Vec<(String, u64)>) {
 /// One cell per this many milliseconds. A multiple of the 200ms event tick in
 /// main, so the text moves one column every other frame.
 const MARQUEE_MS: usize = 400;
+/// How long the text holds still before it starts scrolling, so titles are
+/// readable at their first letter.
+const MARQUEE_DELAY_MS: usize = 1000;
 /// Blank cells between the end of a looping line and its restart.
 const MARQUEE_GAP: &str = "   ";
 
-/// The animation's cell count, shared by every scrolling row. It starts at
-/// zero on the first draw so long titles begin at their first letter.
-fn marquee_offset() -> usize {
-    static START: OnceLock<Instant> = OnceLock::new();
-    START.get_or_init(Instant::now).elapsed().as_millis() as usize / MARQUEE_MS
+/// Which task the marquee is animating and when that row became the target,
+/// so the read delay restarts each time the selection moves instead of
+/// running only once at startup.
+static MARQUEE: Mutex<Option<(Option<u64>, Instant)>> = Mutex::new(None);
+
+/// The animation's cell count for the selected task. It stays at zero through
+/// the initial delay, and the delay restarts whenever the selection changes.
+fn marquee_offset(selection: Option<u64>) -> usize {
+    let now = Instant::now();
+    let mut state = MARQUEE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.as_ref().is_none_or(|(id, _)| *id != selection) {
+        *state = Some((selection, now));
+        return 0;
+    }
+    let (_, start) = state.as_ref().unwrap();
+    let elapsed = (now - *start).as_millis() as usize;
+    elapsed.saturating_sub(MARQUEE_DELAY_MS) / MARQUEE_MS
 }
 
 /// A `width`-cell window over `line` that loops with a gap, so a title too wide
@@ -305,7 +320,7 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
 
     // Borders and the "> " highlight symbol sit outside the content.
     let width = area.width.saturating_sub(4) as usize;
-    let offset = marquee_offset();
+    let offset = marquee_offset(app.selected);
     let mut items: Vec<ListItem> = Vec::new();
     let mut selected = None;
     for row in display_rows(&tasks) {
