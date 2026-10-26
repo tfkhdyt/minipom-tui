@@ -48,14 +48,20 @@ Then run `minipom-tui`.
 | `d`               | delete the selected task (asks first)                        |
 | `D`               | delete every completed task (asks first)                     |
 | `space` / `enter` | mark done / undone                                           |
-| `s`               | start or pause the timer                                     |
+| `s`               | start/pause the focused task, or switch to it                |
 | `x`               | reset the current phase and unpair the task                  |
 | `n`               | skip to the next phase (earns no pomodoro, logs no time)     |
 | `?`               | show the key list                                            |
 | `q`, `ctrl-c`     | quit                                                         |
 
-Starting the timer binds it to the task under the cursor. To switch tasks
-mid-session, move the cursor first and press `s` again.
+Clicking a task row moves the cursor to it; clicking its checkbox marks it done
+or undone, the same as `space`.
+
+Pressing `s` on the task the clock is already credited to starts or pauses it.
+On any other task it starts that task immediately, even if the clock is running
+on something else, so moving the cursor and pressing `s` switches tasks in one
+step. The task stays focused through short and long breaks, so the next work
+phase picks up where you left off; only `x` unpairs it.
 
 Add and edit open one dialog with the title, project (leave it empty for none)
 and tags (comma separated) on screen together. `↓`/`↑` move between fields,

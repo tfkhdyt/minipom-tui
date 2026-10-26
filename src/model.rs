@@ -55,6 +55,10 @@ pub struct TimerState {
     /// The stretch in progress, so tracked time resumes with the clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open: Option<OpenEntry>,
+    /// The focused task, kept through breaks so a restart during one still
+    /// shows what the next work phase belongs to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -358,6 +362,7 @@ mod tests {
                     start: 40,
                     base_secs: 30,
                 }),
+                active: Some(7),
             }),
             ..Data::default()
         };
@@ -370,6 +375,11 @@ mod tests {
         assert_eq!(open.task_id, 7);
         assert_eq!(open.start, 40);
         assert_eq!(open.base_secs, 30);
+        assert_eq!(
+            back.active,
+            Some(7),
+            "the focus survives a break or restart"
+        );
 
         // States written before the open stretch existed still load.
         let old: Data = serde_json::from_str("{\"tasks\":[]}").unwrap();
@@ -378,7 +388,9 @@ mod tests {
             "{\"timer\":{\"phase\":\"Work\",\"remaining_secs\":1,\"work_done\":0,\"running\":false,\"saved_at\":0}}",
         )
         .unwrap();
-        assert!(old.timer.unwrap().open.is_none());
+        let old = old.timer.unwrap();
+        assert!(old.open.is_none());
+        assert!(old.active.is_none());
     }
 
     #[test]

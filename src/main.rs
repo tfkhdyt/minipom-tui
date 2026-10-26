@@ -7,11 +7,14 @@ use std::io::{self, stdout, Stdout, Write};
 use std::time::Duration;
 
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
+use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use app::App;
@@ -21,14 +24,19 @@ fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut out = stdout();
-    execute!(out, EnterAlternateScreen)?;
+    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let result = run(&mut terminal, &mut app);
 
     disable_raw_mode()?;
     // Leave the tab named "minipom" no longer than the app itself.
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, SetTitle(""))?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture,
+        SetTitle("")
+    )?;
     terminal.show_cursor()?;
     app.quit();
 
@@ -44,6 +52,14 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
         if event::poll(tick)? {
             match event::read()? {
                 Event::Key(key) if key.kind != event::KeyEventKind::Release => app.on_key(key),
+                // Only the press acts, so a terminal that reports both press
+                // and release does not toggle a checkbox twice.
+                Event::Mouse(mouse) if mouse.kind == MouseEventKind::Down(MouseButton::Left) => {
+                    let screen = Rect::from(terminal.size()?);
+                    if let Some(hit) = ui::task_at(app, screen, mouse.column, mouse.row) {
+                        app.click_task(hit.id, hit.checkbox);
+                    }
+                }
                 _ => {}
             }
         }

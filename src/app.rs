@@ -4,16 +4,42 @@ use std::time::{Duration, Instant};
 
 use chrono::{Local, NaiveDate};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_width::UnicodeWidthChar;
 
 use crate::model::{now_epoch, Data, Entry, OpenEntry, TimerState};
 use crate::timer::{Phase, Timer};
+
+/// Cells the task name may use in the terminal title. The state, clock and
+/// separator sit outside this budget, so the whole title stays compact.
+const TITLE_LABEL_WIDTH: usize = 40;
+
+/// Cut `label` to `max` cells, marking the cut with an ellipsis. Wide glyphs
+/// are never split, so the result can come in a cell short of the limit.
+fn truncate_label(label: &str, max: usize) -> String {
+    if label.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() <= max {
+        return label.to_string();
+    }
+    let mut out = String::new();
+    let mut width = 0;
+    for c in label.chars() {
+        let w = c.width().unwrap_or(0);
+        if width + w > max.saturating_sub(1) {
+            break;
+        }
+        out.push(c);
+        width += w;
+    }
+    out.push('…');
+    out
+}
 
 pub struct App {
     pub data: Data,
     pub timer: Timer,
     /// Selected task id. Kept by id, not index, so re-sorting never moves it.
     pub selected: Option<u64>,
-    /// Task the running pomodoro is credited to.
+    /// Task the running pomodoro is credited to. It stays bound through short
+    /// and long breaks, so the next work phase keeps the same focus.
     pub active: Option<u64>,
     pub input: Option<Input>,
     pub confirm_delete: Option<Confirm>,
@@ -206,7 +232,7 @@ impl Input {
 }
 
 pub const HELP: &str =
-    "a add  e edit  d del  D clear done  space done  s start/pause  x reset  n skip  q quit";
+    "a add  e edit  d del  D clear done  space done  s start/pause task  x reset  n skip  q quit";
 
 /// How long a status message stays before the key list comes back.
 const STATUS_LINGER: Duration = Duration::from_secs(4);
@@ -244,6 +270,9 @@ impl App {
             timer.running = state.running;
             let gap = (now_epoch() - state.saved_at).max(0) as u64;
             timer.remaining = resume_remaining(state, gap, timer.total());
+            // Keep the focused task across a restart, including one taken
+            // during a break.
+            active = state.active.filter(|id| data.task(*id).is_some());
             // A work stretch that was running at the last save stays bound to
             // its task, so the tracker counts the same time the clock did.
             if state.running && state.phase.is_work() {
@@ -302,6 +331,7 @@ impl App {
             running: self.timer.running,
             saved_at: now_epoch(),
             open: self.open,
+            active: self.active,
         });
         if let Err(e) = self.data.save() {
             self.status = format!("save failed: {e}");
@@ -368,40 +398,65 @@ impl App {
         }
     }
 
+    /// Binds the clock to `id` and runs it. Switching away from another task
+    /// banks the old stretch first, so no time is credited twice.
+    fn start_task(&mut self, id: u64) {
+        if self.active != Some(id) {
+            self.close_entry();
+            self.active = Some(id);
+        }
+        // Starting a task that was finished reopens it.
+        if let Some(t) = self.data.task_mut(id) {
+            t.done = false;
+        }
+        let title = self
+            .data
+            .task(id)
+            .map(|t| t.title.clone())
+            .unwrap_or_default();
+        self.timer.start(Instant::now());
+        self.open_entry();
+        self.persist();
+        if self.timer.phase.is_work() {
+            self.set_status(format!("focusing on {title}"));
+        } else {
+            self.set_status(format!("{} break", self.timer.phase.label().to_lowercase()));
+        }
+    }
+
     fn toggle_timer(&mut self) {
         if self.timer.running {
             self.pause_timer();
             return;
         }
-        // Starting always binds to the highlighted task, so moving the cursor
-        // before pressing s is how you switch tasks mid-session.
-        self.active = self.selected_task_id().or(self.active);
-        match self.active {
-            Some(id) => {
-                // Starting a task that was finished reopens it.
-                if let Some(t) = self.data.task_mut(id) {
-                    t.done = false;
-                }
-                let title = self
-                    .data
-                    .task(id)
-                    .map(|t| t.title.clone())
-                    .unwrap_or_default();
-                self.timer.start(Instant::now());
-                self.open_entry();
-                self.persist();
-                if self.timer.phase.is_work() {
-                    self.set_status(format!("focusing on {title}"));
-                } else {
-                    self.set_status(format!("{} break", self.timer.phase.label().to_lowercase()));
-                }
-            }
-            None if !self.timer.phase.is_work() => {
-                self.timer.start(Instant::now());
-                self.set_status("break started");
-            }
-            None => self.set_status("add a task first, then start the timer"),
+        if !self.timer.phase.is_work() {
+            // Breaks are not credited to a task, so starting one must not move
+            // the focus away from the task it is preparing for.
+            self.timer.start(Instant::now());
+            self.persist();
+            self.set_status("break started");
+            return;
         }
+        if let Some(id) = self.selected_task_id().or(self.active) {
+            self.start_task(id);
+        } else {
+            self.set_status("add a task first, then start the timer");
+        }
+    }
+
+    /// `s` toggles start/pause only when the cursor is on the task the clock is
+    /// credited to. On any other task it starts that task right away, so
+    /// moving the cursor and pressing `s` switches tasks in one step.
+    fn start_or_toggle(&mut self) {
+        if self.timer.phase.is_work() {
+            if let Some(id) = self.selected_task_id() {
+                if self.active != Some(id) {
+                    self.start_task(id);
+                    return;
+                }
+            }
+        }
+        self.toggle_timer();
     }
 
     fn reset_timer(&mut self) {
@@ -415,8 +470,24 @@ impl App {
     fn skip_phase(&mut self) {
         self.close_entry();
         self.timer.skip();
-        self.active = None;
+        // Skipping is not the same as resetting: the focused task survives so
+        // a skipped break still leads back to it.
+        self.persist();
         self.set_status(format!("skipped, now {}", self.timer.phase.label()));
+    }
+
+    /// Flips a task's done flag. Finishing the task the clock is credited to
+    /// ends the session, so no more time is logged against it.
+    fn toggle_done(&mut self, id: u64) {
+        let done = self.data.task_mut(id).map(|t| {
+            t.done = !t.done;
+            t.done
+        });
+        if done == Some(true) && self.active == Some(id) {
+            self.pause_timer();
+            self.active = None;
+        }
+        self.persist();
     }
 
     // ---- inputs --------------------------------------------------------
@@ -531,6 +602,19 @@ impl App {
     }
 
     // ---- events --------------------------------------------------------
+
+    /// A left click on the task list. The clicked row becomes the cursor; a
+    /// click on its checkbox also marks it done or undone, like `space`.
+    /// Dialogs own the screen, so clicks behind one are ignored.
+    pub fn click_task(&mut self, id: u64, checkbox: bool) {
+        if self.input.is_some() || self.confirm_delete.is_some() {
+            return;
+        }
+        self.selected = Some(id);
+        if checkbox {
+            self.toggle_done(id);
+        }
+    }
 
     pub fn on_key(&mut self, key: KeyEvent) {
         if self.input.is_some() {
@@ -647,19 +731,10 @@ impl App {
             }
             KeyCode::Char(' ') | KeyCode::Enter => {
                 if let Some(id) = self.selected_task_id() {
-                    let done = self.data.task_mut(id).map(|t| {
-                        t.done = !t.done;
-                        t.done
-                    });
-                    // Finishing the task the clock is credited to ends the session.
-                    if done == Some(true) && self.active == Some(id) {
-                        self.pause_timer();
-                        self.active = None;
-                    }
-                    self.persist();
+                    self.toggle_done(id);
                 }
             }
-            KeyCode::Char('s') => self.toggle_timer(),
+            KeyCode::Char('s') => self.start_or_toggle(),
             KeyCode::Char('x') => self.reset_timer(),
             KeyCode::Char('n') => self.skip_phase(),
             KeyCode::Char('?') => self.set_status(HELP),
@@ -682,8 +757,8 @@ impl App {
         }
         let finished = self.timer.phase;
         if finished.is_work() {
+            // Bank the work stretch but keep the task focused for the break.
             self.close_entry();
-            self.active = None;
         }
         self.timer.complete();
         if finished.is_work() {
@@ -715,7 +790,8 @@ impl App {
 
     /// Terminal title: run state, time left and the task (or the phase when no
     /// task is bound). Control characters are dropped so a stored title cannot
-    /// inject escape sequences.
+    /// inject escape sequences, and a long task name is cut to one line's worth
+    /// of cells so the title bar stays readable.
     pub fn title(&self) -> String {
         let secs =
             self.timer.remaining.as_secs() + u64::from(self.timer.remaining.subsec_millis() > 0);
@@ -732,6 +808,7 @@ impl App {
             self.timer.phase.label().to_lowercase()
         };
         let label: String = label.chars().filter(|c| !c.is_control()).collect();
+        let label = truncate_label(&label, TITLE_LABEL_WIDTH);
         format!("{glyph} {:02}:{:02} · {label}", secs / 60, secs % 60)
     }
 
@@ -746,6 +823,27 @@ impl App {
             .as_secs()
             .saturating_sub(open.base_secs);
         Some((open.task_id, secs))
+    }
+}
+
+#[cfg(test)]
+impl App {
+    /// A bare app over `data`, for tests in other modules that need the state
+    /// but not the store on disk.
+    pub(crate) fn for_test(data: Data) -> Self {
+        Self {
+            data,
+            timer: Timer::new(Default::default()),
+            selected: None,
+            active: None,
+            input: None,
+            confirm_delete: None,
+            status: String::new(),
+            today: Local::now().date_naive(),
+            should_quit: false,
+            open: None,
+            status_expiry: None,
+        }
     }
 }
 
@@ -783,7 +881,7 @@ mod tests {
         app.timer.remaining = Duration::from_secs(65);
         assert_eq!(app.title(), "⏸ 01:05 · write docs");
 
-        // A break has no task bound, so the phase stands in.
+        // With no task bound, the phase stands in.
         app.active = None;
         app.timer.phase = Phase::ShortBreak;
         app.timer.remaining = Duration::from_secs(300);
@@ -800,6 +898,23 @@ mod tests {
     }
 
     #[test]
+    fn title_truncates_long_task_names() {
+        let (mut app, id) = app_with_task();
+        app.data.task_mut(id).unwrap().title = "x".repeat(80);
+        assert_eq!(
+            app.title(),
+            format!("⏸ 25:00 · {}…", "x".repeat(TITLE_LABEL_WIDTH - 1))
+        );
+    }
+
+    #[test]
+    fn truncate_label_keeps_wide_glyphs_whole() {
+        let label = "漢".repeat(30);
+        let out = truncate_label(&label, 40);
+        assert_eq!(out, format!("{}…", "漢".repeat(19)));
+    }
+
+    #[test]
     fn resume_counts_time_while_the_app_was_closed() {
         let state = |remaining_secs, running| TimerState {
             phase: Phase::Work,
@@ -808,6 +923,7 @@ mod tests {
             running,
             saved_at: 0,
             open: None,
+            active: None,
         };
         let total = Duration::from_secs(1500);
 
@@ -906,6 +1022,141 @@ mod tests {
             "starting reopens the task"
         );
         assert!(app.timer.running);
+    }
+
+    #[test]
+    fn s_toggles_the_clocked_task_but_starts_any_other() {
+        std::env::set_var(
+            "XDG_DATA_HOME",
+            std::env::temp_dir().join("minipom-tui-test-s"),
+        );
+
+        let (mut app, id) = app_with_task();
+        let other = app.data.add_task("other".into());
+        let s = || KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
+
+        // On the task the clock is credited to, s starts and then pauses.
+        app.selected = Some(id);
+        app.on_key(s());
+        assert!(app.timer.running, "first press starts the focused task");
+        app.on_key(s());
+        assert!(
+            !app.timer.running,
+            "second press pauses instead of restarting"
+        );
+        assert_eq!(app.active, Some(id), "pausing keeps the task bound");
+
+        // On another task, s starts that task right away instead of pausing.
+        app.selected = Some(other);
+        let remaining = app.timer.remaining;
+        app.on_key(s());
+        assert!(app.timer.running, "a different task starts immediately");
+        assert_eq!(app.active, Some(other));
+        assert_eq!(app.timer.remaining, remaining, "the clock is not restarted");
+        assert!(
+            app.open.is_some_and(|e| e.task_id == other),
+            "the stretch is credited to the new task"
+        );
+
+        // Switching again while running keeps the clock going and moves the
+        // open stretch, without pausing.
+        app.selected = Some(id);
+        app.on_key(s());
+        assert!(app.timer.running);
+        assert_eq!(app.active, Some(id));
+        assert!(app.open.is_some_and(|e| e.task_id == id));
+    }
+
+    #[test]
+    fn breaks_keep_the_focused_task() {
+        std::env::set_var(
+            "XDG_DATA_HOME",
+            std::env::temp_dir().join("minipom-tui-test-break-focus"),
+        );
+
+        let (mut app, id) = app_with_task();
+        // The first work phase earns a long break.
+        app.timer.settings.long_every = 1;
+        app.timer.start(Instant::now());
+        app.timer.remaining = Duration::ZERO;
+
+        assert_eq!(app.tick(), Some(Phase::Work));
+        assert_eq!(app.timer.phase, Phase::LongBreak);
+        assert_eq!(app.active, Some(id), "the focus survives the long break");
+        assert_eq!(app.active_title().as_deref(), Some("write docs"));
+
+        // The same holds for a short break.
+        app.timer.settings.long_every = 4;
+        app.timer.phase = Phase::Work;
+        app.timer.work_done = 0;
+        app.timer.running = true;
+        app.timer.remaining = Duration::ZERO;
+
+        assert_eq!(app.tick(), Some(Phase::Work));
+        assert_eq!(app.timer.phase, Phase::ShortBreak);
+        assert_eq!(app.active, Some(id), "the focus survives the short break");
+    }
+
+    #[test]
+    fn starting_or_skipping_a_break_keeps_the_focused_task() {
+        std::env::set_var(
+            "XDG_DATA_HOME",
+            std::env::temp_dir().join("minipom-tui-test-break-start"),
+        );
+
+        let (mut app, id) = app_with_task();
+        let other = app.data.add_task("other".into());
+        app.active = Some(id);
+        app.timer.phase = Phase::ShortBreak;
+        app.timer.remaining = app.timer.total();
+        app.selected = Some(other);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(app.timer.running, "s starts the break");
+        assert_eq!(
+            app.active,
+            Some(id),
+            "starting a break does not move the focus to the cursor"
+        );
+
+        app.timer.pause();
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert_eq!(app.timer.phase, Phase::Work, "skipping the break moves on");
+        assert_eq!(app.active, Some(id), "skipping keeps the focused task");
+    }
+
+    #[test]
+    fn clicking_selects_a_task_and_the_checkbox_toggles_it() {
+        std::env::set_var(
+            "XDG_DATA_HOME",
+            std::env::temp_dir().join("minipom-tui-test-click"),
+        );
+
+        let (mut app, first) = app_with_task();
+        let second = app.data.add_task("second".into());
+        app.selected = Some(first);
+
+        // A click anywhere on the row just moves the cursor.
+        app.click_task(second, false);
+        assert_eq!(app.selected, Some(second));
+        assert!(!app.data.task(second).unwrap().done);
+
+        // The checkbox behaves like space.
+        app.click_task(second, true);
+        assert!(app.data.task(second).unwrap().done);
+        app.click_task(second, true);
+        assert!(!app.data.task(second).unwrap().done);
+
+        // Finishing the task the clock is credited to unbinds it.
+        app.click_task(first, true);
+        assert!(app.data.task(first).unwrap().done);
+        assert!(app.active.is_none());
+
+        // A dialog owns the screen, so clicks behind it are ignored.
+        app.open_form(Draft::default());
+        app.click_task(second, true);
+        assert_eq!(app.selected, Some(first));
+        assert!(!app.data.task(second).unwrap().done);
     }
 
     #[test]

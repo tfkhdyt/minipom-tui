@@ -150,14 +150,22 @@ fn panes(area: Rect) -> (Rect, Rect, Rect) {
     (list, focus, today)
 }
 
+/// The selected row's pointer, and the two cells every row leaves for it.
+const HIGHLIGHT: &str = "> ";
+
+/// The main area and the two status rows under it.
+fn frame_panes(area: Rect) -> (Rect, Rect) {
+    let rows = Layout::vertical([Constraint::Min(5), Constraint::Length(2)]).split(area);
+    (rows[0], rows[1])
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
     // No backdrop is painted: unset cells keep the terminal's own background,
     // which is what lets a translucent terminal stay translucent.
 
     // Two rows: key hints on top, the latest message under them. Keeping the
     // hints in place means a toast never hides what the keys are.
-    let rows = Layout::vertical([Constraint::Min(5), Constraint::Length(2)]).split(f.area());
-    let (main, status) = (rows[0], rows[1]);
+    let (main, status) = frame_panes(f.area());
     let status_rows = Layout::vertical([Constraint::Length(1); 2]).split(status);
 
     let (list, focus, today) = panes(main);
@@ -294,6 +302,56 @@ fn marquee(line: &Line<'static>, offset: usize, width: usize) -> Line<'static> {
     Line::from(out)
 }
 
+/// A task row under the pointer, and whether the click landed on its checkbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TaskHit {
+    pub id: u64,
+    pub checkbox: bool,
+}
+
+/// The task under a screen cell, if that cell is on a task row of the list.
+///
+/// This follows what `draw` puts on screen: the same pane split, the same rows
+/// and the same scroll offset the `List` picks to keep the selection visible.
+/// Every row is one line tall, so the offset is simply the selected row pushed
+/// back far enough to sit inside the panel.
+pub fn task_at(app: &App, screen: Rect, column: u16, row: u16) -> Option<TaskHit> {
+    let (main, _) = frame_panes(screen);
+    let (list, _, _) = panes(main);
+    let inner = Block::bordered().inner(list);
+    if column < inner.x || column >= inner.right() || row < inner.y || row >= inner.bottom() {
+        return None;
+    }
+
+    let ordered = app.data.ordered();
+    let tasks: Vec<&Task> = ordered.iter().filter_map(|id| app.data.task(*id)).collect();
+    let rows = display_rows(&tasks);
+    let selected = rows
+        .iter()
+        .position(|row| matches!(row, Row::Task(t) if app.selected == Some(t.id)));
+
+    let height = inner.height as usize;
+    let offset = selected.map_or(0, |s| s.saturating_sub(height.saturating_sub(1)));
+    let task = match rows.get(offset + usize::from(row - inner.y))? {
+        Row::Task(task) => *task,
+        Row::Heading(_) => return None,
+    };
+
+    // The highlight symbol is only reserved when a row is selected, matching
+    // the list's default "when selected" spacing.
+    let text = inner.x
+        + if selected.is_some() {
+            HIGHLIGHT.len() as u16
+        } else {
+            0
+        };
+    let prefix = task_prefix(app, task).width() as u16;
+    Some(TaskHit {
+        id: task.id,
+        checkbox: column >= text && column < text + prefix,
+    })
+}
+
 enum Row<'a> {
     Heading(String),
     Task(&'a Task),
@@ -360,7 +418,7 @@ fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items)
         .block(panel(format!(" Tasks ({}) ", tasks.len())))
         .highlight_style(Style::new().bg(SURFACE).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
+        .highlight_symbol(HIGHLIGHT);
 
     let mut state = ListState::default().with_selected(selected);
     f.render_stateful_widget(list, area, &mut state);
@@ -787,5 +845,66 @@ mod tests {
             })
             .collect();
         assert_eq!(shape, vec!["#(no project)", "a", "#work", "b", "c"]);
+    }
+
+    #[test]
+    fn task_at_maps_screen_cells_to_task_rows() {
+        let mut data = crate::model::Data::default();
+        let a = data.add_task("a".into());
+        let b = data.add_task("b".into());
+        data.task_mut(b).unwrap().project = Some("work".into());
+        let mut app = App::for_test(data);
+        app.selected = Some(a);
+
+        // 100x40 gives a 62-column list; its content starts one cell inside.
+        let screen = Rect::new(0, 0, 100, 40);
+        // Row 1 is the "(no project)" heading, row 2 the task under it.
+        assert_eq!(task_at(&app, screen, 10, 1), None);
+        assert_eq!(
+            task_at(&app, screen, 10, 2),
+            Some(TaskHit {
+                id: a,
+                checkbox: false
+            })
+        );
+        // The checkbox covers the marker and the box itself.
+        assert_eq!(
+            task_at(&app, screen, 4, 2),
+            Some(TaskHit {
+                id: a,
+                checkbox: true
+            })
+        );
+        // Row 3 is the "work" heading, row 4 the task under it.
+        assert_eq!(task_at(&app, screen, 10, 3), None);
+        assert_eq!(
+            task_at(&app, screen, 10, 4),
+            Some(TaskHit {
+                id: b,
+                checkbox: false
+            })
+        );
+        // Borders and empty space below the rows are not tasks.
+        assert_eq!(task_at(&app, screen, 0, 2), None);
+        assert_eq!(task_at(&app, screen, 10, 36), None);
+    }
+
+    #[test]
+    fn task_at_follows_the_list_scroll_offset() {
+        let mut data = crate::model::Data::default();
+        let ids: Vec<u64> = (0..10)
+            .map(|i| data.add_task(format!("task {i}")))
+            .collect();
+        let mut app = App::for_test(data);
+        app.selected = Some(*ids.last().unwrap());
+
+        // 20x10 leaves a 10x6 content area, so six rows are on screen.
+        let screen = Rect::new(0, 0, 20, 10);
+        // One heading plus ten tasks: the selection scrolls the window to the
+        // last six rows, which start at the fifth task.
+        let top = task_at(&app, screen, 10, 1).unwrap();
+        assert_eq!(top.id, ids[4]);
+        let bottom = task_at(&app, screen, 10, 6).unwrap();
+        assert_eq!(bottom.id, *ids.last().unwrap());
     }
 }
