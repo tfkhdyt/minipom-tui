@@ -39,6 +39,7 @@ const SURFACE: Color = Color::Indexed(236); // #303030 selected row
 const BORDER: Color = Color::Indexed(245); // #8a8a8a frames; decorative, so it may sit back
 const TRACK: Color = Color::Indexed(238); // #444444 unfilled part of the timer bar
 const TEXT: Color = Color::Indexed(252); // #d0d0d0 all text; 8.6:1 or better on both surfaces
+const TOAST_BG: Color = Color::Indexed(159); // #afffff the toast's light cyan, explicit like every surface
 
 fn base() -> Style {
     Style::new().fg(TEXT)
@@ -179,7 +180,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     // The message gets its own row below the hints, so it can never cover them.
     if app.status != HELP {
         let toast = Paragraph::new(app.status.clone())
-            .style(Style::new().fg(INK).bg(Color::Cyan))
+            .style(Style::new().fg(INK).bg(TOAST_BG))
             .alignment(Alignment::Center);
         f.render_widget(toast, status_rows[1]);
     }
@@ -206,8 +207,14 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
 }
 
-/// Tracked time so far today, including the stretch still in progress.
+/// Tracked time so far today, including the stretch still in progress. A
+/// stretch that began on another day is left out: banking records its entry
+/// under the day it started, and the panel must not promise minutes that
+/// today's totals give back.
 fn with_live_time(app: &App, totals: &mut Vec<(String, u64)>) {
+    if app.live_day() != Some(app.today) {
+        return;
+    }
     let Some((task_id, secs)) = app.live() else {
         return;
     };
@@ -722,6 +729,62 @@ fn draw_prompt_lines(f: &mut Frame, lines: Vec<Line<'static>>, title: &str, bord
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::OpenEntry;
+    use chrono::Local;
+    use std::time::Duration;
+
+    /// Whole seconds for `h:00` today in the local timezone, like the model
+    /// tests use, so tests do not depend on a fixed timezone.
+    fn today_at(h: u32) -> i64 {
+        Local::now()
+            .date_naive()
+            .and_hms_opt(h, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .earliest()
+            .unwrap()
+            .timestamp()
+    }
+
+    fn app_on_project() -> (App, u64) {
+        let mut data = crate::model::Data::default();
+        let id = data.add_task("a".into());
+        data.task_mut(id).unwrap().project = Some("work".into());
+        let mut app = App::for_test(data);
+        app.timer.running = true;
+        (app, id)
+    }
+
+    #[test]
+    fn live_time_joins_today_only_when_the_stretch_started_today() {
+        let (mut app, id) = app_on_project();
+        // The clock has run 20 minutes of the phase.
+        app.timer.remaining = app.timer.total() - Duration::from_secs(1200);
+
+        let mut totals = Vec::new();
+        with_live_time(&app, &mut totals);
+        assert!(totals.is_empty(), "no stretch, no live minutes");
+
+        app.set_open(Some(OpenEntry {
+            task_id: id,
+            start: today_at(9),
+            base_secs: 0,
+        }));
+        let mut totals = Vec::new();
+        with_live_time(&app, &mut totals);
+        assert_eq!(totals, vec![("work".to_string(), 1200)]);
+
+        // A stretch begun yesterday banks under yesterday, so it must not be
+        // counted into today before that either.
+        app.set_open(Some(OpenEntry {
+            task_id: id,
+            start: today_at(9) - 86400,
+            base_secs: 0,
+        }));
+        let mut totals = Vec::new();
+        with_live_time(&app, &mut totals);
+        assert!(totals.is_empty(), "yesterday's stretch stays out of today");
+    }
 
     #[test]
     fn panes_stack_the_side_panels_when_the_window_looks_portrait() {

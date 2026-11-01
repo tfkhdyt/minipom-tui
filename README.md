@@ -44,6 +44,8 @@ Then run `minipom-tui`.
 | `e`               | edit the selected task in the same dialog                    |
 | `↓` / `↑`         | in the task dialog, move to the next or previous field       |
 | `←` / `→`         | in the task dialog, choose among suggestions, else move the cursor |
+| `home` / `end`    | in the task dialog, jump to the start or end of the text     |
+| `delete`          | in the task dialog, drop the character ahead of the cursor   |
 | `tab`             | in the task dialog, accept the highlighted suggestion        |
 | `d`               | delete the selected task (asks first)                        |
 | `D`               | delete every completed task (asks first)                     |
@@ -67,7 +69,9 @@ Add and edit open one dialog with the title, project (leave it empty for none)
 and tags (comma separated) on screen together. `↓`/`↑` move between fields,
 `←`/`→` highlight a suggestion, `tab` accepts it, `enter` saves and `esc`
 discards everything. When no value matches, the arrows move the text cursor
-instead and `tab` does nothing.
+instead and `tab` does nothing. Pasting into a field works through bracketed
+paste: control characters such as newlines are dropped, so a paste can never
+carry a raw terminal sequence into a task.
 
 The key list sits in the bottom row and stays there. Status messages appear on
 the row below it for 4 seconds, so a toast never hides the keys.
@@ -80,8 +84,13 @@ Everything lives in one JSON file:
 $XDG_DATA_HOME/minipom-tui/data.json     # ~/.local/share/minipom-tui/data.json
 ```
 
-It is written on every change. If it is ever unreadable it is moved aside
-instead of being overwritten, and the reason shows up in the status bar.
+It is written on every change and only readable by your user. If it is ever
+unreadable it is moved aside instead of being overwritten, and the reason
+shows up in the status bar.
+
+A second instance refuses to start whenever one is already running against
+the same store; if the app ever crashed and left a stale lock, the next start
+takes it over. Its lock lives next to the data file.
 
 Durations are fixed at 25/5/15 with a long break every 4 work phases.
 

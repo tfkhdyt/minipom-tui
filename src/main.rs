@@ -1,4 +1,5 @@
 mod app;
+mod lock;
 mod model;
 mod timer;
 mod ui;
@@ -8,7 +9,8 @@ use std::time::Duration;
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -18,29 +20,75 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use app::App;
+use model::Data;
 
 fn main() -> io::Result<()> {
-    let mut app = App::new();
+    // Whatever unwinds, the user's shell must come back usable first.
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_stdout();
+        report(info);
+    }));
 
-    enable_raw_mode()?;
-    let mut out = stdout();
-    execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
+    // Two copies of the app would share one store, so refuse to start twice.
+    if let Err(message) = lock::acquire(&Data::lock_path()) {
+        eprintln!("minipom-tui: {message}");
+        return Ok(());
+    }
+
+    // A start that fails during setup must not lock the store away, so the
+    // lock is released before the error is handed back.
+    let (mut terminal, mut app) = match startup() {
+        Ok(pair) => pair,
+        Err(e) => {
+            lock::release(&Data::lock_path());
+            return Err(e);
+        }
+    };
 
     let result = run(&mut terminal, &mut app);
+    restore_stdout();
+    app.quit();
+    lock::release(&Data::lock_path());
+    result
+}
 
-    disable_raw_mode()?;
-    // Leave the tab named "minipom" no longer than the app itself.
+/// Puts the terminal into the alternate screen under raw mode. On any error
+/// the partial setup is undone before it propagates.
+fn startup() -> io::Result<(Terminal<CrosstermBackend<Stdout>>, App)> {
+    let app = App::new();
+    enable_raw_mode()?;
+    let mut out = stdout();
+    if let Err(e) = execute!(
+        out,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    ) {
+        disable_raw_mode().ok();
+        return Err(e);
+    }
+    match Terminal::new(CrosstermBackend::new(out)) {
+        Ok(terminal) => Ok((terminal, app)),
+        Err(e) => {
+            restore_stdout();
+            Err(e)
+        }
+    }
+}
+
+/// Returns the terminal to a usable state: raw mode off, main screen back,
+/// mouse capture and bracketed paste restored, the tab title cleared.
+fn restore_stdout() {
+    disable_raw_mode().ok();
     execute!(
-        terminal.backend_mut(),
+        stdout(),
         LeaveAlternateScreen,
         DisableMouseCapture,
+        DisableBracketedPaste,
         SetTitle("")
-    )?;
-    terminal.show_cursor()?;
-    app.quit();
-
-    result
+    )
+    .ok();
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::Result<()> {
@@ -60,6 +108,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> io::
                         app.click_task(hit.id, hit.checkbox);
                     }
                 }
+                Event::Paste(text) => app.on_paste(&text),
                 _ => {}
             }
         }

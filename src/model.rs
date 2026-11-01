@@ -82,7 +82,7 @@ pub fn now_epoch() -> i64 {
 }
 
 /// `secs` as a date in the machine's local timezone.
-fn local_date(secs: i64) -> Option<NaiveDate> {
+pub(crate) fn local_date(secs: i64) -> Option<NaiveDate> {
     DateTime::from_timestamp(secs, 0).map(|dt| dt.with_timezone(&Local).date_naive())
 }
 
@@ -94,6 +94,11 @@ impl Data {
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
             .unwrap_or_else(|| PathBuf::from("."));
         base.join("minipom-tui").join("data.json")
+    }
+
+    /// Where the single-instance lock lives, next to the store.
+    pub fn lock_path() -> PathBuf {
+        Self::data_path().with_extension("json.lock")
     }
 
     /// Loads the store. A missing file is normal; an unreadable file is moved
@@ -128,14 +133,27 @@ impl Data {
         }
     }
 
+    /// Swaps the freshly serialized text into place, atomically and readable
+    /// only by the owner on unix.
+    #[cfg(not(test))]
     pub fn save(&self) -> io::Result<()> {
         let path = Self::data_path();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        let bytes = serde_json::to_vec_pretty(self)?;
         let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        write_private(&tmp, &bytes)?;
         std::fs::rename(tmp, path)
+    }
+
+    /// Under test the store stays off disk: making the check jump through
+    /// per-test redirects races on process-global state, so the real save is
+    /// compiled out and the data is only validated instead.
+    #[cfg(test)]
+    pub fn save(&self) -> io::Result<()> {
+        serde_json::to_vec_pretty(self)?;
+        Ok(())
     }
 
     pub fn add_task(&mut self, title: String) -> u64 {
@@ -242,6 +260,29 @@ impl Data {
             )
         });
         tasks.iter().map(|t| t.id).collect()
+    }
+}
+
+/// Writes to a path only readable by the owner on unix, so the store's
+/// permissions cannot expose personal tracking data on a shared machine.
+#[cfg(not(test))]
+fn write_private(path: &PathBuf, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
     }
 }
 

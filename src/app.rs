@@ -420,7 +420,8 @@ impl App {
         if self.timer.phase.is_work() {
             self.set_status(format!("focusing on {title}"));
         } else {
-            self.set_status(format!("{} break", self.timer.phase.label().to_lowercase()));
+            // The labels already carry the word "break".
+            self.set_status(self.timer.phase.label().to_lowercase());
         }
     }
 
@@ -617,6 +618,12 @@ impl App {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        // Ctrl+C quits from anywhere, dialogs included, so the form can never
+        // trap the terminal reflex.
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.should_quit = true;
+            return;
+        }
         if self.input.is_some() {
             self.on_key_input(key);
         } else if self.confirm_delete.is_some() {
@@ -683,6 +690,31 @@ impl App {
                     }
                 }
             }
+            KeyCode::Home => {
+                if let Some(input) = self.input.as_mut() {
+                    input.cursor = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(input) = self.input.as_mut() {
+                    input.cursor = input.value(input.field).len();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(input) = self.input.as_mut() {
+                    let at = input.cursor;
+                    let next = input
+                        .value(input.field)
+                        .get(at..)
+                        .and_then(|s| s.chars().next())
+                        .map(|c| c.len_utf8());
+                    if let Some(n) = next {
+                        input.value_mut().replace_range(at..at + n, "");
+                        input.cursor = at;
+                        input.choice = 0;
+                    }
+                }
+            }
             KeyCode::Char(c) => {
                 if let Some(input) = self.input.as_mut() {
                     let at = input.cursor;
@@ -695,10 +727,25 @@ impl App {
         }
     }
 
+    /// A multi-character insert, from bracketed paste. Control characters are
+    /// dropped, so a paste can never carry a newline or an escape sequence
+    /// into a stored task.
+    pub fn on_paste(&mut self, text: &str) {
+        let Some(input) = self.input.as_mut() else {
+            return;
+        };
+        let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+        if clean.is_empty() {
+            return;
+        }
+        let at = input.cursor.min(input.value(input.field).len());
+        input.value_mut().insert_str(at, &clean);
+        input.cursor = at + clean.len();
+        input.choice = 0;
+    }
+
     fn on_key_normal(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('c') if ctrl => self.should_quit = true,
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
@@ -824,6 +871,14 @@ impl App {
             .saturating_sub(open.base_secs);
         Some((open.task_id, secs))
     }
+
+    /// The local day the open stretch began on. Banking records the whole
+    /// entry under this day, so a display that adds the in-flight seconds to
+    /// anything must match on it.
+    pub fn live_day(&self) -> Option<NaiveDate> {
+        let open = self.open.as_ref()?;
+        crate::model::local_date(open.start)
+    }
 }
 
 #[cfg(test)]
@@ -844,6 +899,11 @@ impl App {
             open: None,
             status_expiry: None,
         }
+    }
+
+    /// Opens (or drops) the in-flight stretch, for tests outside this module.
+    pub(crate) fn set_open(&mut self, entry: Option<OpenEntry>) {
+        self.open = entry;
     }
 }
 
@@ -980,11 +1040,6 @@ mod tests {
 
     #[test]
     fn closing_an_entry_logs_exactly_the_seconds_the_clock_ran() {
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            std::env::temp_dir().join("minipom-tui-test-clock"),
-        );
-
         let (mut app, id) = app_with_task();
         let total = app.timer.total();
         app.timer.running = true;
@@ -1008,11 +1063,6 @@ mod tests {
 
     #[test]
     fn starting_a_done_task_clears_done() {
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            std::env::temp_dir().join("minipom-tui-test"),
-        );
-
         let (mut app, id) = app_with_task();
         app.data.task_mut(id).unwrap().done = true;
 
@@ -1026,11 +1076,6 @@ mod tests {
 
     #[test]
     fn s_toggles_the_clocked_task_but_starts_any_other() {
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            std::env::temp_dir().join("minipom-tui-test-s"),
-        );
-
         let (mut app, id) = app_with_task();
         let other = app.data.add_task("other".into());
         let s = || KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE);
@@ -1069,11 +1114,6 @@ mod tests {
 
     #[test]
     fn breaks_keep_the_focused_task() {
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            std::env::temp_dir().join("minipom-tui-test-break-focus"),
-        );
-
         let (mut app, id) = app_with_task();
         // The first work phase earns a long break.
         app.timer.settings.long_every = 1;
@@ -1099,11 +1139,6 @@ mod tests {
 
     #[test]
     fn starting_or_skipping_a_break_keeps_the_focused_task() {
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            std::env::temp_dir().join("minipom-tui-test-break-start"),
-        );
-
         let (mut app, id) = app_with_task();
         let other = app.data.add_task("other".into());
         app.active = Some(id);
@@ -1127,11 +1162,6 @@ mod tests {
 
     #[test]
     fn clicking_selects_a_task_and_the_checkbox_toggles_it() {
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            std::env::temp_dir().join("minipom-tui-test-click"),
-        );
-
         let (mut app, first) = app_with_task();
         let second = app.data.add_task("second".into());
         app.selected = Some(first);
@@ -1193,11 +1223,6 @@ mod tests {
 
     #[test]
     fn clearing_completed_tasks_keeps_the_selection_and_drops_the_clock() {
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            std::env::temp_dir().join("minipom-tui-test"),
-        );
-
         let (mut app, id) = app_with_task();
         app.data.task_mut(id).unwrap().done = true;
         let open = app.data.add_task("still open".into());
@@ -1212,11 +1237,6 @@ mod tests {
 
     #[test]
     fn add_and_edit_collect_title_project_and_tags() {
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            std::env::temp_dir().join("minipom-tui-test"),
-        );
-
         let mut app = App {
             data: Data::default(),
             timer: Timer::new(Default::default()),
@@ -1386,12 +1406,6 @@ mod tests {
 
     #[test]
     fn done_pauses_only_the_clocked_task() {
-        // One test, so the redirected store cannot race with a sibling.
-        std::env::set_var(
-            "XDG_DATA_HOME",
-            std::env::temp_dir().join("minipom-tui-test"),
-        );
-
         let (mut app, id) = app_with_task();
         let other = app.data.add_task("other".into());
         app.active = Some(other);
@@ -1407,5 +1421,77 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(!app.timer.running, "finishing the clocked task pauses it");
         assert!(app.active.is_none(), "a finished task is no longer on");
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_a_dialog_too() {
+        let (mut app, _) = app_with_task();
+        let quit_but_inserted_char = |mut app: App| -> App {
+            // A plain 'c' only types a letter: the reflex must not close the form.
+            app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+            assert!(!app.should_quit);
+            app
+        };
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert!(app.input.is_some(), "the form is open");
+        let mut app = quit_but_inserted_char(app);
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit, "Ctrl+C quits with the form open");
+
+        // The delete prompt is the other dialog, and the same reflex works.
+        let (mut app, _) = app_with_task();
+        app.confirm_delete = Some(Confirm::One(1));
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.should_quit, "Ctrl+C quits over the delete prompt");
+    }
+
+    #[test]
+    fn home_end_and_delete_edit_the_field() {
+        let (mut app, _) = app_with_task();
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        for c in "abcd".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+
+        // End is a no-op at the end; Home jumps there.
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().cursor, 4);
+        app.on_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().cursor, 0);
+
+        // Delete drops the character ahead of the caret.
+        app.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value(Field::Title), "bcd");
+        assert_eq!(app.input.as_ref().unwrap().cursor, 0);
+        app.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value(Field::Title), "cd");
+
+        // Delete at the end does nothing, like backspace at the start.
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().value(Field::Title), "cd");
+    }
+
+    #[test]
+    fn paste_inserts_at_the_cursor_and_drops_control_characters() {
+        let (mut app, _) = app_with_task();
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.input.as_ref().unwrap().cursor, 0);
+
+        app.on_paste("ab\n\rc\u{1b}d\t");
+        assert_eq!(
+            app.input.as_ref().unwrap().value(Field::Title),
+            "abcdx",
+            "newlines and escapes are gone, the text is in the caret's place"
+        );
+        assert_eq!(app.input.as_ref().unwrap().cursor, 4);
+
+        // Outside the form a paste is simply dropped.
+        let (mut app, _) = app_with_task();
+        app.on_paste("leak");
+        assert!(app.input.is_none());
+        assert_eq!(app.data.ordered().len(), 1);
     }
 }

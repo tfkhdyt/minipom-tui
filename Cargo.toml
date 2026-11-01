@@ -8,6 +8,8 @@ repository = "https://github.com/tfkhdyt/minipom-tui"
 readme = "README.md"
 keywords = ["pomodoro", "tui", "timer", "time-tracking", "productivity"]
 categories = ["command-line-utilities"]
+# README asks for 1.87 or newer; u32::is_multiple_of (timer.rs) needs it.
+rust-version = "1.87"
 
 [dependencies]
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "unstable-rendered-line-info"] }
