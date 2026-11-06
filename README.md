@@ -51,7 +51,7 @@ Then run `minipom-tui`.
 | `D`               | delete every completed task (asks first)                     |
 | `space` / `enter` | mark done / undone                                           |
 | `s`               | start/pause the focused task, or switch to it                |
-| `x`               | reset the current phase and unpair the task                  |
+| `x`               | reset to a fresh work phase and unpair the task              |
 | `n`               | skip to the next phase (earns no pomodoro, logs no time)     |
 | `?`               | show the key list                                            |
 | `q`, `ctrl-c`     | quit                                                         |
